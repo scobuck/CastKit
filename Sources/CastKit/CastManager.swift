@@ -13,6 +13,7 @@ public class CastManager: ObservableObject {
 
     private let scanner = CastDeviceScanner()
     private var client: CastClient?
+    private var currentApp: CastApp?
     private var scannerDelegate: ScannerDelegate?
     private var clientDelegate: ClientDelegate?
 
@@ -28,6 +29,8 @@ public class CastManager: ObservableObject {
     public weak var player: (any CastablePlayer)?
     /// Called when casting ends with the last known cast playback position.
     public var onCastEnded: ((TimeInterval) -> Void)?
+    /// Called when the cast device reports an updated playback position.
+    public var onCastPositionUpdated: ((TimeInterval) -> Void)?
 
     public init() {
         scannerDelegate = ScannerDelegate(manager: self)
@@ -126,9 +129,10 @@ public class CastManager: ObservableObject {
         )
 
         isCastPlaying = true
-        client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak client] result in
+        client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self, weak client] result in
             switch result {
             case .success(let app):
+                Task { @MainActor in self?.currentApp = app }
                 client?.load(media: media, with: app) { _ in }
             case .failure:
                 break
@@ -155,11 +159,27 @@ public class CastManager: ObservableObject {
         client?.seek(to: Float(seconds))
     }
 
+    /// Request the current media status from the Cast device.
+    /// Triggers `onCastPositionUpdated` callback when the response arrives.
+    public func requestMediaStatus() {
+        guard let client, let app = currentApp else { return }
+        client.requestMediaStatus(for: app) { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                if case .success(let status) = result {
+                    self.castPosition = status.adjustedCurrentTime
+                    self.onCastPositionUpdated?(status.adjustedCurrentTime)
+                }
+            }
+        }
+    }
+
     public func disconnect() {
         let lastPosition = castPosition
         client?.stopCurrentApp()
         client?.disconnect()
         client = nil
+        currentApp = nil
         clientDelegate = nil
         isConnected = false
         connectedDeviceName = nil
@@ -259,6 +279,7 @@ public class CastManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager else { return }
                 manager.castPosition = status.adjustedCurrentTime
+                manager.onCastPositionUpdated?(status.adjustedCurrentTime)
             }
         }
     }
