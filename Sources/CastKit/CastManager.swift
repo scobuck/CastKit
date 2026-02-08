@@ -129,6 +129,25 @@ public class CastManager: ObservableObject {
         }
     }
 
+    // MARK: - Direct Playback Control
+
+    /// Pause playback on the Cast device only (does not affect local player).
+    public func pauseCast() {
+        client?.pause()
+        isCastPlaying = false
+    }
+
+    /// Resume playback on the Cast device only (does not affect local player).
+    public func resumeCast() {
+        client?.play()
+        isCastPlaying = true
+    }
+
+    /// Seek to a position on the Cast device.
+    public func seekCast(to seconds: TimeInterval) {
+        client?.seek(to: Float(seconds))
+    }
+
     public func disconnect() {
         client?.stopCurrentApp()
         client?.disconnect()
@@ -138,6 +157,11 @@ public class CastManager: ObservableObject {
         connectedDeviceName = nil
         isCastPlaying = false
         player?.unmuteFromCast()
+    }
+
+    deinit {
+        client?.stopCurrentApp()
+        client?.disconnect()
     }
 
     // MARK: - Scanner Delegate
