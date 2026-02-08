@@ -14,10 +14,12 @@ public class CastManager: ObservableObject {
     private var scannerDelegate: ScannerDelegate?
     private var clientDelegate: ClientDelegate?
 
-    /// The stream URL to cast — set by the app on launch.
+    /// The stream URL to cast — set by the app before calling castStream().
     public var streamURL: String = ""
     /// The station name to show on the Cast device.
     public var stationName: String = ""
+    /// The MIME content type for the stream (e.g. "audio/flac", "audio/mpeg").
+    public var contentType: String = "audio/mpeg"
     /// Reference to the local player for pausing/resuming during Cast.
     public weak var player: (any CastablePlayer)?
 
@@ -111,8 +113,8 @@ public class CastManager: ObservableObject {
             artist: displayArtist,
             url: url,
             poster: artworkURL,
-            contentType: "audio/mpeg",
-            streamType: .live,
+            contentType: contentType,
+            streamType: .buffered,
             autoplay: true
         )
 
