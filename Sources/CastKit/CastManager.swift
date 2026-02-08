@@ -216,6 +216,8 @@ public class CastManager: ObservableObject {
         func castClient(_ client: CastClient, didConnectTo device: CastDevice) {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager else { return }
+                // Start cast from the player's current position
+                manager.startPosition = manager.player?.currentPlaybackTime ?? 0
                 manager.player?.muteForCast()
                 manager.isConnected = true
                 manager.connectedDeviceName = device.name
@@ -226,7 +228,7 @@ public class CastManager: ObservableObject {
 
         func castClient(_ client: CastClient, didDisconnectFrom device: CastDevice) {
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager else { return }
+                guard let manager = self?.manager, manager.isConnected else { return }
                 let lastPosition = manager.castPosition
                 manager.isConnected = false
                 manager.connectedDeviceName = nil
