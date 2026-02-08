@@ -8,6 +8,8 @@ public class CastManager: ObservableObject {
     @Published public var connectedDeviceName: String?
     @Published public var isCastPlaying = false
     @Published public var castVolume: Float = 1.0
+    /// Last known playback position on the Cast device (seconds).
+    @Published public var castPosition: TimeInterval = 0
 
     private let scanner = CastDeviceScanner()
     private var client: CastClient?
@@ -20,8 +22,12 @@ public class CastManager: ObservableObject {
     public var stationName: String = ""
     /// The MIME content type for the stream (e.g. "audio/flac", "audio/mpeg").
     public var contentType: String = "audio/mpeg"
+    /// The position (seconds) to start playback from when loading media.
+    public var startPosition: TimeInterval = 0
     /// Reference to the local player for pausing/resuming during Cast.
     public weak var player: (any CastablePlayer)?
+    /// Called when casting ends with the last known cast playback position.
+    public var onCastEnded: ((TimeInterval) -> Void)?
 
     public init() {
         scannerDelegate = ScannerDelegate(manager: self)
@@ -115,7 +121,8 @@ public class CastManager: ObservableObject {
             poster: artworkURL,
             contentType: contentType,
             streamType: .buffered,
-            autoplay: true
+            autoplay: true,
+            currentTime: startPosition
         )
 
         isCastPlaying = true
@@ -149,6 +156,7 @@ public class CastManager: ObservableObject {
     }
 
     public func disconnect() {
+        let lastPosition = castPosition
         client?.stopCurrentApp()
         client?.disconnect()
         client = nil
@@ -157,6 +165,7 @@ public class CastManager: ObservableObject {
         connectedDeviceName = nil
         isCastPlaying = false
         player?.unmuteFromCast()
+        onCastEnded?(lastPosition)
     }
 
     deinit {
@@ -218,10 +227,12 @@ public class CastManager: ObservableObject {
         func castClient(_ client: CastClient, didDisconnectFrom device: CastDevice) {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager else { return }
+                let lastPosition = manager.castPosition
                 manager.isConnected = false
                 manager.connectedDeviceName = nil
                 manager.isCastPlaying = false
                 manager.player?.unmuteFromCast()
+                manager.onCastEnded?(lastPosition)
             }
         }
 
@@ -242,6 +253,11 @@ public class CastManager: ObservableObject {
             }
         }
 
-        func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus) {}
+        func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager else { return }
+                manager.castPosition = status.adjustedCurrentTime
+            }
+        }
     }
 }
