@@ -100,10 +100,15 @@ castManager.disconnect()
 - **CastClient** — Low-level Google Cast V2 protocol client (TLS, protobuf, channels)
 - **Channel types** — Heartbeat, receiver control, media control, multizone, device auth/connection/discovery/setup
 
+## Acknowledgements
+
+CastKit is inspired by [OpenCastSwift](https://github.com/mhmiles/OpenCastSwift) by Miles Ake, an early open-source Swift implementation of the Google Cast protocol.
+
 ## Dependencies
 
-- [apple/swift-protobuf](https://github.com/apple/swift-protobuf) (1.28.0+) — for the Cast V2 protocol
+- [apple/swift-protobuf](https://github.com/apple/swift-protobuf) (1.28.0+, Apache 2.0) — for the Cast V2 protocol
+- [SwiftyJSON](https://github.com/SwiftyJSON/SwiftyJSON) (MIT, vendored) — JSON parsing
 
 ## License
 
-GPL-3.0
+MIT — see [LICENSE](LICENSE) for details.
