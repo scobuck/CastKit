@@ -129,13 +129,19 @@ public class CastManager: ObservableObject {
         )
 
         isCastPlaying = true
-        client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self, weak client] result in
-            switch result {
-            case .success(let app):
-                Task { @MainActor in self?.currentApp = app }
-                client?.load(media: media, with: app) { _ in }
-            case .failure:
-                break
+
+        if let currentApp {
+            // Already have a running session — load new media directly
+            client.load(media: media, with: currentApp) { _ in }
+        } else {
+            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self, weak client] result in
+                switch result {
+                case .success(let app):
+                    Task { @MainActor in self?.currentApp = app }
+                    client?.load(media: media, with: app) { _ in }
+                case .failure:
+                    break
+                }
             }
         }
     }

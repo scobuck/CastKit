@@ -15,7 +15,7 @@ extension CastMessage {
       let json = try JSONSerialization.data(withJSONObject: payload, options: [])
 
       guard let jsonString = String(data: json, encoding: .utf8) else {
-        fatalError("error forming json string")
+        throw CastError.request("Failed to form JSON string from payload")
       }
 
       message.payloadType = .string

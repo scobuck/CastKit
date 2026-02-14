@@ -22,8 +22,10 @@ class ReceiverControlChannel: CastChannel {
     guard let rawType = json["type"].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
+      #if DEBUG
       print("Unknown type: \(rawType)")
       print(json)
+      #endif
       return
     }
 
@@ -32,7 +34,9 @@ class ReceiverControlChannel: CastChannel {
       delegate?.channel(self, didReceive: CastStatus(json: json))
 
     default:
+      #if DEBUG
       print(rawType)
+      #endif
     }
   }
 

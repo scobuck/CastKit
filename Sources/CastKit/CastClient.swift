@@ -106,6 +106,14 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   public var statusDidChange: ((CastStatus) -> Void)?
   public var mediaStatusDidChange: ((CastMediaStatus) -> Void)?
 
+  private let lock = NSLock()
+
+  private func withLock<T>(_ body: () -> T) -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return body()
+  }
+
   public init(device: CastDevice) {
     self.device = device
 
@@ -153,7 +161,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
         let settings: [String: Any] = [
           kCFStreamSSLValidatesCertificateChain as String: false,
-          kCFStreamSSLLevel as String: kCFStreamSocketSecurityLevelTLSv1,
+          kCFStreamSSLLevel as String: kCFStreamSocketSecurityLevelNegotiatedSSL,
           kCFStreamPropertyShouldCloseNativeSocket as String: true
         ]
 
@@ -184,6 +192,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         self.outputStream.open()
 
         self.streamRunLoop = CFRunLoopGetCurrent()
+        // Blocks this GCD thread to receive stream events. The heartbeat
+        // channel's disconnect timer serves as the connection watchdog and
+        // will call disconnect() (which stops this run loop) on timeout.
         RunLoop.current.run()
       } catch {
         DispatchQueue.main.async { self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error as NSError) }
@@ -196,7 +207,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       isConnected = false
     }
 
-    channels.values.forEach(remove)
+    withLock { channels }.values.forEach(remove)
 
     if let runLoop = streamRunLoop {
       CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
@@ -226,15 +237,18 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     let packet = NSMutableData(bytes: &payloadSize, length: MemoryLayout<UInt32>.size)
     packet.append(data)
 
-    let streamBytes = packet.bytes.bindMemory(to: UInt8.self, capacity: data.count)
+    let bytes = packet.bytes.bindMemory(to: UInt8.self, capacity: packet.length)
 
-    let bytesWritten = outputStream.write(streamBytes, maxLength: packet.length)
-    if bytesWritten < 0 {
-      if let error = outputStream.streamError {
-        throw CastError.write("Error writing \(packet.length) byte(s) to stream: \(error)")
-      } else {
-        throw CastError.write("Unknown error writing \(packet.length) byte(s) to stream")
+    var totalWritten = 0
+    while totalWritten < packet.length {
+      let written = outputStream.write(bytes + totalWritten, maxLength: packet.length - totalWritten)
+      if written < 0 {
+        throw CastError.write("Failed to write to stream")
       }
+      if written == 0 {
+        throw CastError.write("Stream unexpectedly closed")
+      }
+      totalWritten += written
     }
   }
 
@@ -261,7 +275,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       while let payload = reader?.nextMessage() {
         let message = try CastMessage(serializedData: payload)
 
-        guard let channel = channels[message.namespace] else { return }
+        guard let channel = withLock({ channels[message.namespace] }) else { return }
 
         switch message.payloadType {
         case .string:
@@ -280,7 +294,11 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
                                  sourceId: message.sourceID)
         }
       }
-    } catch { }
+    } catch {
+      #if DEBUG
+      print("CastClient: Failed to parse message: \(error)")
+      #endif
+    }
   }
 
   //MARK: - Channelable
@@ -327,9 +345,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   private lazy var currentRequestId = Int(arc4random_uniform(800))
 
   func nextRequestId() -> Int {
-    currentRequestId += 1
-
-    return currentRequestId
+    return withLock {
+      currentRequestId += 1
+      return currentRequestId
+    }
   }
 
   private let senderName: String = "sender-\(UUID().uuidString)"
@@ -338,7 +357,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   func send(_ request: CastRequest, response: CastResponseHandler?) {
     if let response = response {
-      responseHandlers[request.id] = response
+      withLock { responseHandlers[request.id] = response }
     }
 
     let requestId = request.id
@@ -366,8 +385,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   private func callResponseHandler(for requestId: Int, with result: Result<JSON, CastError>) {
-    DispatchQueue.main.async {
-      if let handler = self.responseHandlers.removeValue(forKey: requestId) {
+    let handler = withLock { self.responseHandlers.removeValue(forKey: requestId) }
+    if let handler = handler {
+      DispatchQueue.main.async {
         handler(result)
       }
     }
@@ -471,7 +491,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
           self.mediaControlChannel.sendPause(for: app, mediaSessionId: mediaStatus.mediaSessionId)
 
         case .failure(let error):
-            print(error)
+          #if DEBUG
+          print(error)
+          #endif
         }
       }
     }
@@ -489,7 +511,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
           self.mediaControlChannel.sendPlay(for: app, mediaSessionId: mediaStatus.mediaSessionId)
 
         case .failure(let error):
+          #if DEBUG
           print(error)
+          #endif
         }
       }
     }
@@ -507,7 +531,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
           self.mediaControlChannel.sendStop(for: app, mediaSessionId: mediaStatus.mediaSessionId)
 
         case .failure(let error):
+          #if DEBUG
           print(error)
+          #endif
         }
       }
     }
@@ -525,7 +551,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
           self.mediaControlChannel.sendSeek(to: currentTime, for: app, mediaSessionId: mediaStatus.mediaSessionId)
 
         case .failure(let error):
+          #if DEBUG
           print(error)
+          #endif
         }
       }
     }
@@ -545,7 +573,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   public func setVolume(_ volume: Float, for device: CastMultizoneDevice) {
     guard device.capabilities.contains(.multizoneGroup) else {
+      #if DEBUG
       print("Attempted to set zone volume on non-multizone device")
+      #endif
       return
     }
 
@@ -554,7 +584,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   public func setMuted(_ isMuted: Bool, for device: CastMultizoneDevice) {
     guard device.capabilities.contains(.multizoneGroup) else {
+      #if DEBUG
       print("Attempted to mute zone on non-multizone device")
+      #endif
       return
     }
 

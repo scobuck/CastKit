@@ -22,8 +22,10 @@ class MultizoneControlChannel: CastChannel {
     guard let rawType = json["type"].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
+      #if DEBUG
       print("Unknown type: \(rawType)")
       print(json)
+      #endif
       return
     }
 
@@ -44,8 +46,10 @@ class MultizoneControlChannel: CastChannel {
       delegate?.channel(self, removed: deviceId)
 
     default:
+      #if DEBUG
       print(rawType)
       print(json)
+      #endif
     }
   }
 

@@ -41,6 +41,14 @@ class CastV2PlatformReader {
 
     let payloadSize = Int(CFSwapInt32BigToHost(header))
 
+    let maxPayloadSize = 1_048_576 // 1 MB
+    guard payloadSize <= maxPayloadSize else {
+      // Skip this oversized message
+      buffer.removeAll()
+      readPosition = 0
+      return nil
+    }
+
     readPosition += headerSize
 
     guard buffer.count >= readPosition + payloadSize, payloadSize >= 0 else {

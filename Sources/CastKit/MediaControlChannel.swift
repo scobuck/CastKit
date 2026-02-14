@@ -14,8 +14,10 @@ class MediaControlChannel: CastChannel {
     guard let rawType = json["type"].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
+      #if DEBUG
       print("Unknown type: \(rawType)")
       print(json)
+      #endif
       return
     }
 
@@ -26,7 +28,9 @@ class MediaControlChannel: CastChannel {
       delegate?.channel(self, didReceive: CastMediaStatus(json: status))
 
     default:
+      #if DEBUG
       print(rawType)
+      #endif
     }
   }
 

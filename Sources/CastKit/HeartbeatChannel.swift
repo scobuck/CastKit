@@ -40,14 +40,18 @@ class HeartbeatChannel: CastChannel {
     guard let rawType = json["type"].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
+      #if DEBUG
       print("Unknown type: \(rawType)")
       print(json)
+      #endif
       return
     }
 
     if type == .ping {
       sendPong(to: sourceId)
+      #if DEBUG
       print("PING from \(sourceId)")
+      #endif
     }
 
     disconnectTimer = Timer(timeInterval: disconnectTimeout,

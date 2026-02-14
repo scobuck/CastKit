@@ -1,7 +1,7 @@
 import Foundation
 
 extension CastDevice {
-  convenience init(service: NetService, info: [String: String]) {
+  convenience init?(service: NetService, info: [String: String]) {
     var ipAddress: String?
 
     if let address = service.addresses?.first {
@@ -14,10 +14,12 @@ extension CastDevice {
       }
     }
 
+    guard let hostName = service.hostName else { return nil }
+
     self.init(id: info["id"] ?? "",
               name: info["fn"] ?? service.name,
               modelName: info["md"] ?? "Google Cast",
-              hostName: service.hostName!,
+              hostName: hostName,
               ipAddress: ipAddress ?? "",
               port: service.port,
               capabilitiesMask: info["ca"].flatMap(Int.init) ?? 0,
@@ -177,7 +179,8 @@ extension CastDeviceScanner: NetServiceDelegate {
       return
     }
 
-    addDevice(CastDevice(service: sender, info: infoDict))
+    guard let device = CastDevice(service: sender, info: infoDict) else { return }
+    addDevice(device)
   }
 
   public func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
@@ -196,7 +199,7 @@ extension NetService {
     }
 
     var dict = [String: String]()
-    NetService.dictionary(fromTXTRecord: data).forEach({ dict[$0.key] = String(data: $0.value, encoding: .utf8)! })
+    NetService.dictionary(fromTXTRecord: data).forEach({ dict[$0.key] = String(data: $0.value, encoding: .utf8) ?? "" })
 
     return dict
   }

@@ -14,7 +14,9 @@ open class CastChannel: NSObject {
   }
 
   open func handleResponse(_ data: Data, sourceId: String) {
+    #if DEBUG
     print("\n--Binary response--\n")
+    #endif
   }
 
   public func send(_ request: CastRequest, response: CastResponseHandler? = nil) {
