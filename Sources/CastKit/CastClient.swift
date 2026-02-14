@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftProtobuf
 // SwiftyJSON is vendored in the same module
 
@@ -106,11 +107,11 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   public var statusDidChange: ((CastStatus) -> Void)?
   public var mediaStatusDidChange: ((CastMediaStatus) -> Void)?
 
-  private let lock = NSLock()
+  private var _lock = os_unfair_lock()
 
   private func withLock<T>(_ body: () -> T) -> T {
-    lock.lock()
-    defer { lock.unlock() }
+    os_unfair_lock_lock(&_lock)
+    defer { os_unfair_lock_unlock(&_lock) }
     return body()
   }
 
@@ -207,6 +208,15 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       isConnected = false
     }
 
+    let handlers = withLock {
+      let h = responseHandlers
+      responseHandlers.removeAll()
+      return h
+    }
+    for (_, entry) in handlers {
+      entry.timeout.cancel()
+    }
+
     withLock { channels }.values.forEach(remove)
 
     if let runLoop = streamRunLoop {
@@ -234,14 +244,15 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   private func write(data: Data) throws {
     var payloadSize = UInt32(data.count).bigEndian
-    let packet = NSMutableData(bytes: &payloadSize, length: MemoryLayout<UInt32>.size)
+    var packet = withUnsafeBytes(of: &payloadSize) { Data($0) }
     packet.append(data)
 
-    let bytes = packet.bytes.bindMemory(to: UInt8.self, capacity: packet.length)
-
     var totalWritten = 0
-    while totalWritten < packet.length {
-      let written = outputStream.write(bytes + totalWritten, maxLength: packet.length - totalWritten)
+    while totalWritten < packet.count {
+      let written = packet.withUnsafeBytes { rawBuffer in
+        let bytes = rawBuffer.bindMemory(to: UInt8.self)
+        return outputStream.write(bytes.baseAddress! + totalWritten, maxLength: packet.count - totalWritten)
+      }
       if written < 0 {
         throw CastError.write("Failed to write to stream")
       }
@@ -272,6 +283,8 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     do {
       reader?.readStream()
 
+      var pendingResponses = [(Int, Result<JSON, CastError>)]()
+
       while let payload = reader?.nextMessage() {
         let message = try CastMessage(serializedData: payload)
 
@@ -279,19 +292,34 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
         switch message.payloadType {
         case .string:
-          if let messageData = message.payloadUtf8.data(using: .utf8) {
-            let json = JSON(messageData)
+          let json = JSON(parseJSON: message.payloadUtf8)
 
-            channel.handleResponse(json,
-                                   sourceId: message.sourceID)
+          channel.handleResponse(json,
+                                 sourceId: message.sourceID)
 
-            if let requestId = json[CastJSONPayloadKeys.requestId].int {
-              callResponseHandler(for: requestId, with: .success(json))
-            }
+          if let requestId = json[CastJSONPayloadKeys.requestId].int {
+            pendingResponses.append((requestId, .success(json)))
           }
         case .binary:
           channel.handleResponse(message.payloadBinary,
                                  sourceId: message.sourceID)
+        }
+      }
+
+      if !pendingResponses.isEmpty {
+        let entriesToDispatch: [(CastResponseHandler, Result<JSON, CastError>)] = pendingResponses.compactMap { (requestId, result) in
+          let entry = withLock { self.responseHandlers.removeValue(forKey: requestId) }
+          entry?.timeout.cancel()
+          guard let handler = entry?.handler else { return nil }
+          return (handler, result)
+        }
+
+        if !entriesToDispatch.isEmpty {
+          DispatchQueue.main.async {
+            for (handler, result) in entriesToDispatch {
+              handler(result)
+            }
+          }
         }
       }
     } catch {
@@ -353,11 +381,21 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   private let senderName: String = "sender-\(UUID().uuidString)"
 
-  private var responseHandlers = [Int: CastResponseHandler]()
+  private var responseHandlers = [Int: (handler: CastResponseHandler, timeout: DispatchWorkItem)]()
 
   func send(_ request: CastRequest, response: CastResponseHandler?) {
     if let response = response {
-      withLock { responseHandlers[request.id] = response }
+      let timeoutWork = DispatchWorkItem { [weak self] in
+        guard let self = self else { return }
+        let handler = self.withLock { self.responseHandlers.removeValue(forKey: request.id)?.handler }
+        if let handler = handler {
+          DispatchQueue.main.async {
+            handler(.failure(.request("Request timed out")))
+          }
+        }
+      }
+      DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: timeoutWork)
+      withLock { responseHandlers[request.id] = (handler: response, timeout: timeoutWork) }
     }
 
     let requestId = request.id
@@ -385,8 +423,9 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   private func callResponseHandler(for requestId: Int, with result: Result<JSON, CastError>) {
-    let handler = withLock { self.responseHandlers.removeValue(forKey: requestId) }
-    if let handler = handler {
+    let entry = withLock { self.responseHandlers.removeValue(forKey: requestId) }
+    entry?.timeout.cancel()
+    if let handler = entry?.handler {
       DispatchQueue.main.async {
         handler(result)
       }

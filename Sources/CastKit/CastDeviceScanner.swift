@@ -205,7 +205,9 @@ extension NetService {
   }
 
   var id: String? {
-    return infoDict?["id"]
+    guard let data = txtRecordData() else { return nil }
+    let dict = NetService.dictionary(fromTXTRecord: data)
+    return dict["id"].flatMap { String(data: $0, encoding: .utf8) }
   }
 }
 

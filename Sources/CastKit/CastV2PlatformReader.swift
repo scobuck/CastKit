@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 private let maxBufferLength = 8192
 
@@ -6,16 +7,17 @@ class CastV2PlatformReader {
   let stream: InputStream
   var readPosition = 0
   var buffer = Data(capacity: maxBufferLength)
+  private var _lock = os_unfair_lock()
 
   init(stream: InputStream) {
     self.stream = stream
   }
 
   func readStream() {
-    objc_sync_enter(self)
-    defer { objc_sync_exit(self) }
+    os_unfair_lock_lock(&_lock)
+    defer { os_unfair_lock_unlock(&_lock) }
 
-    let bufferSize = 32
+    let bufferSize = 4096
 
     while stream.hasBytesAvailable {
       var bytes = [UInt8](repeating: 0, count: bufferSize)
@@ -29,8 +31,8 @@ class CastV2PlatformReader {
   }
 
   func nextMessage() -> Data? {
-    objc_sync_enter(self)
-    defer { objc_sync_exit(self) }
+    os_unfair_lock_lock(&_lock)
+    defer { os_unfair_lock_unlock(&_lock) }
 
     let headerSize = MemoryLayout<UInt32>.size
     guard buffer.count - readPosition >= headerSize else { return nil }
@@ -68,9 +70,9 @@ class CastV2PlatformReader {
     guard buffer.count >= maxBufferLength else { return }
 
     if readPosition == buffer.count {
-      buffer = Data(capacity: maxBufferLength)
+      buffer.removeAll(keepingCapacity: true)
     } else {
-      buffer = Data(buffer[readPosition...])
+      buffer.removeFirst(readPosition)
     }
 
     readPosition = 0
