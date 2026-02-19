@@ -243,6 +243,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   // MARK: - Socket Lifecycle
 
   private func write(data: Data) throws {
+    guard let outputStream = outputStream else {
+      throw CastError.write("Output stream is nil")
+    }
+
     var payloadSize = UInt32(data.count).bigEndian
     var packet = withUnsafeBytes(of: &payloadSize) { Data($0) }
     packet.append(data)
@@ -405,18 +409,19 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
                                                        sourceId: senderName,
                                                        destinationId: request.destinationId)
 
-      if let runLoop = streamRunLoop {
-        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
-          do {
-            try self.write(data: messageData)
-          } catch {
-            self.callResponseHandler(for: requestId, with: .failure(.request(error.localizedDescription)))
-          }
-        }
-        CFRunLoopWakeUp(runLoop)
-      } else {
-        try write(data: messageData)
+      guard let runLoop = streamRunLoop else {
+        callResponseHandler(for: requestId, with: .failure(.request("Not connected")))
+        return
       }
+
+      CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
+        do {
+          try self.write(data: messageData)
+        } catch {
+          self.callResponseHandler(for: requestId, with: .failure(.request(error.localizedDescription)))
+        }
+      }
+      CFRunLoopWakeUp(runLoop)
     } catch {
       callResponseHandler(for: requestId, with: .failure(.request(error.localizedDescription)))
     }

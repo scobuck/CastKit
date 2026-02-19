@@ -41,8 +41,10 @@ public class CastManager: ObservableObject {
             object: scanner,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.availableDevices = self.scanner.devices
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.availableDevices = self.scanner.devices
+            }
         }
 
         #if os(iOS) || os(tvOS)
@@ -51,9 +53,11 @@ public class CastManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.client?.stopCurrentApp()
-            self.client?.disconnect()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.client?.stopCurrentApp()
+                self.client?.disconnect()
+            }
         }
         #elseif os(macOS)
         NotificationCenter.default.addObserver(
@@ -61,15 +65,21 @@ public class CastManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.client?.stopCurrentApp()
-            self.client?.disconnect()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.client?.stopCurrentApp()
+                self.client?.disconnect()
+            }
         }
         #endif
     }
 
     public func startScanning() {
         scanner.startScanning()
+    }
+
+    public func restartScanning() {
+        scanner.restartScanning()
     }
 
     public func stopScanning() {
@@ -209,22 +219,22 @@ public class CastManager: ObservableObject {
         }
 
         func deviceDidComeOnline(_ device: CastDevice) {
-            Task { @MainActor [weak self] in
-                guard let self, let manager = self.manager else { return }
+            MainActor.assumeIsolated {
+                guard let manager else { return }
                 manager.availableDevices = manager.scanner.devices
             }
         }
 
         func deviceDidChange(_ device: CastDevice) {
-            Task { @MainActor [weak self] in
-                guard let self, let manager = self.manager else { return }
+            MainActor.assumeIsolated {
+                guard let manager else { return }
                 manager.availableDevices = manager.scanner.devices
             }
         }
 
         func deviceDidGoOffline(_ device: CastDevice) {
-            Task { @MainActor [weak self] in
-                guard let self, let manager = self.manager else { return }
+            MainActor.assumeIsolated {
+                guard let manager else { return }
                 manager.availableDevices = manager.scanner.devices
             }
         }

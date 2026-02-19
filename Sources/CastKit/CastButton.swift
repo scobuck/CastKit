@@ -58,9 +58,16 @@ public struct CastButton: View {
             showDevicePicker = true
         }) {
             CastIcon()
-                .fill(castManager.isConnected ? Color.blue : Color.primary)
-                .frame(width: 20, height: 16)
+                .fill(castManager.isConnected ? Color.accentColor : Color.secondary)
+                #if os(iOS)
+                .frame(width: 18, height: 14)
+                #else
+                .frame(width: 15, height: 12)
+                #endif
+                .padding(8)
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .sheet(isPresented: $showDevicePicker) {
             CastDevicePickerSheet()
                 .environmentObject(castManager)
@@ -71,6 +78,8 @@ public struct CastButton: View {
 public struct CastDevicePickerSheet: View {
     @EnvironmentObject var castManager: CastManager
     @Environment(\.dismiss) private var dismiss
+    @State private var sliderVolume: Float = 0
+    @State private var isDraggingSlider = false
 
     public init() {}
 
@@ -91,15 +100,15 @@ public struct CastDevicePickerSheet: View {
                     ForEach(castManager.availableDevices, id: \.id) { device in
                         let isActive = castManager.isConnected && castManager.connectedDeviceName == device.name
 
-                        Button(action: {
-                            if isActive {
-                                castManager.disconnect()
-                            } else {
-                                castManager.connect(to: device)
-                            }
-                            dismiss()
-                        }) {
-                            VStack(spacing: 0) {
+                        VStack(spacing: 0) {
+                            Button(action: {
+                                if isActive {
+                                    castManager.disconnect()
+                                } else {
+                                    castManager.connect(to: device)
+                                }
+                                dismiss()
+                            }) {
                                 HStack {
                                     Image(systemName: "tv")
                                         .foregroundColor(.blue)
@@ -116,24 +125,27 @@ public struct CastDevicePickerSheet: View {
                                             .foregroundColor(.blue)
                                     }
                                 }
-
-                                if isActive {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: "speaker.fill")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Slider(value: Binding(
-                                            get: { castManager.castVolume },
-                                            set: { castManager.setCastVolume($0) }
-                                        ), in: 0...1)
-                                        Image(systemName: "speaker.wave.3.fill")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    .padding(.top, 8)
-                                    .onTapGesture { }
-                                }
                             }
+
+                            #if !os(tvOS)
+                            if isActive {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "speaker.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Slider(value: $sliderVolume, in: 0...1, onEditingChanged: { editing in
+                                        isDraggingSlider = editing
+                                        if !editing {
+                                            castManager.setCastVolume(sliderVolume)
+                                        }
+                                    })
+                                    Image(systemName: "speaker.wave.3.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                .padding(.top, 8)
+                            }
+                            #endif
                         }
                     }
                 }
@@ -151,10 +163,18 @@ public struct CastDevicePickerSheet: View {
             }
         }
         .onAppear {
+            sliderVolume = castManager.castVolume
             castManager.startScanning()
+        }
+        .onChange(of: castManager.castVolume) { _, newValue in
+            if !isDraggingSlider {
+                sliderVolume = newValue
+            }
         }
         #if os(iOS)
         .presentationDetents([.medium])
+        #elseif os(macOS)
+        .frame(minWidth: 350, minHeight: 300)
         #endif
     }
 }
