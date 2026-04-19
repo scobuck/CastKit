@@ -6,6 +6,7 @@ public enum CastMediaPlayerState: String, Sendable {
   case playing = "PLAYING"
   case paused = "PAUSED"
   case stopped = "STOPPED"
+  case idle = "IDLE"
 }
 
 public final class CastMediaStatus: NSObject, @unchecked Sendable {
@@ -16,6 +17,8 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
   public let currentTime: Double
   public let metadata: JSON?
   public let contentID: String?
+  /// Reason the player entered IDLE state (e.g. "FINISHED", "CANCELLED", "ERROR").
+  public let idleReason: String?
   private let createdDate = Date()
 
   public var adjustedCurrentTime: Double {
@@ -46,6 +49,8 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
     } else {
       contentID = nil
     }
+
+    idleReason = json["idleReason"].string
 
     super.init()
   }

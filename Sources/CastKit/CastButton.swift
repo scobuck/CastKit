@@ -58,7 +58,7 @@ public struct CastButton: View {
             showDevicePicker = true
         }) {
             CastIcon()
-                .fill(castManager.isConnected ? Color.accentColor : Color.secondary)
+                .fill(castManager.isConnected ? Color.primary : Color.primary.opacity(0.7))
                 #if os(iOS)
                 .frame(width: 18, height: 14)
                 #else
@@ -84,6 +84,127 @@ public struct CastDevicePickerSheet: View {
     public init() {}
 
     public var body: some View {
+        #if os(macOS)
+        macOSBody
+        #else
+        iOSBody
+        #endif
+    }
+
+    // MARK: - macOS
+
+    #if os(macOS)
+    private var macOSBody: some View {
+        VStack(spacing: 0) {
+            Text("Cast to Device")
+                .font(.headline)
+                .padding()
+
+            Divider()
+
+            if castManager.availableDevices.isEmpty {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("Searching for Cast devices…")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
+            } else {
+                VStack(spacing: 2) {
+                    ForEach(castManager.availableDevices, id: \.id) { device in
+                        deviceButton(device)
+                    }
+                }
+                .padding()
+            }
+
+            Spacer()
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding()
+        }
+        .frame(minWidth: 380, idealWidth: 450, minHeight: 300, idealHeight: 400)
+        .onChange(of: castManager.isConnected) { _, connected in
+            if connected { dismiss() }
+        }
+        .onAppear {
+            sliderVolume = castManager.castVolume
+            castManager.startScanning()
+        }
+        .onChange(of: castManager.castVolume) { _, newValue in
+            if !isDraggingSlider {
+                sliderVolume = newValue
+            }
+        }
+    }
+
+    private func deviceButton(_ device: CastDevice) -> some View {
+        let isActive = castManager.isConnected && castManager.connectedDeviceName == device.name
+
+        return Button(action: {
+            if isActive {
+                castManager.disconnect()
+                dismiss()
+            } else {
+                castManager.connect(to: device)
+            }
+        }) {
+            VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "tv")
+                        .foregroundColor(.blue)
+                    VStack(alignment: .leading) {
+                        Text(device.name)
+                            .foregroundColor(.primary)
+                        Text(device.modelName)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    if isActive {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.blue)
+                    }
+                }
+
+                if isActive {
+                    HStack(spacing: 8) {
+                        Image(systemName: "speaker.fill")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Slider(value: $sliderVolume, in: 0...1, onEditingChanged: { editing in
+                            isDraggingSlider = editing
+                            if !editing {
+                                castManager.setCastVolume(sliderVolume)
+                            }
+                        })
+                        Image(systemName: "speaker.wave.3.fill")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.top, 8)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
+        }
+        .buttonStyle(.plain)
+    }
+    #endif
+
+    // MARK: - iOS / tvOS
+
+    private var iOSBody: some View {
         NavigationStack {
             List {
                 if castManager.availableDevices.isEmpty {
@@ -104,10 +225,10 @@ public struct CastDevicePickerSheet: View {
                             Button(action: {
                                 if isActive {
                                     castManager.disconnect()
+                                    dismiss()
                                 } else {
                                     castManager.connect(to: device)
                                 }
-                                dismiss()
                             }) {
                                 HStack {
                                     Image(systemName: "tv")
@@ -166,6 +287,9 @@ public struct CastDevicePickerSheet: View {
             sliderVolume = castManager.castVolume
             castManager.startScanning()
         }
+        .onChange(of: castManager.isConnected) { _, connected in
+            if connected { dismiss() }
+        }
         .onChange(of: castManager.castVolume) { _, newValue in
             if !isDraggingSlider {
                 sliderVolume = newValue
@@ -173,8 +297,6 @@ public struct CastDevicePickerSheet: View {
         }
         #if os(iOS)
         .presentationDetents([.medium])
-        #elseif os(macOS)
-        .frame(minWidth: 350, minHeight: 300)
         #endif
     }
 }

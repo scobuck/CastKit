@@ -81,7 +81,8 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       guard let status = currentStatus else { return }
 
       if oldValue != status {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
           self.delegate?.castClient(self, deviceStatusDidChange: status)
           self.statusDidChange?(status)
         }
@@ -94,7 +95,8 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       guard let status = currentMediaStatus else { return }
 
       if oldValue != status {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
           self.delegate?.castClient(self, mediaStatusDidChange: status)
           self.mediaStatusDidChange?(status)
         }
@@ -131,9 +133,15 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     didSet {
       if oldValue != isConnected {
         if isConnected {
-          DispatchQueue.main.async { self.delegate?.castClient(self, didConnectTo: self.device) }
+          DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.castClient(self, didConnectTo: self.device)
+          }
         } else {
-          DispatchQueue.main.async { self.delegate?.castClient(self, didDisconnectFrom: self.device) }
+          DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.castClient(self, didDisconnectFrom: self.device)
+          }
         }
       }
     }
@@ -163,7 +171,6 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         let settings: [String: Any] = [
           kCFStreamSSLValidatesCertificateChain as String: false,
           kCFStreamSSLLevel as String: kCFStreamSocketSecurityLevelNegotiatedSSL,
-          kCFStreamPropertyShouldCloseNativeSocket as String: true
         ]
 
         CFStreamCreatePairWithSocketToHost(nil, self.device.hostName as CFString, UInt32(self.device.port), &readStream, &writeStream)
@@ -176,7 +183,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
           throw CastError.connection("Unable to create output stream")
         }
 
-        DispatchQueue.main.async { self.delegate?.castClient(self, willConnectTo: self.device) }
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.delegate?.castClient(self, willConnectTo: self.device)
+        }
 
         CFReadStreamSetProperty(readStreamRetained, CFStreamPropertyKey(kCFStreamPropertySSLSettings), settings as CFTypeRef?)
         CFWriteStreamSetProperty(writeStreamRetained, CFStreamPropertyKey(kCFStreamPropertySSLSettings), settings as CFTypeRef?)
@@ -198,7 +208,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         // will call disconnect() (which stops this run loop) on timeout.
         RunLoop.current.run()
       } catch {
-        DispatchQueue.main.async { self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error as NSError) }
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error as NSError)
+        }
       }
     }
   }
@@ -255,7 +268,8 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     while totalWritten < packet.count {
       let written = packet.withUnsafeBytes { rawBuffer in
         let bytes = rawBuffer.bindMemory(to: UInt8.self)
-        return outputStream.write(bytes.baseAddress! + totalWritten, maxLength: packet.count - totalWritten)
+        guard let baseAddress = bytes.baseAddress else { return -1 }
+        return outputStream.write(baseAddress + totalWritten, maxLength: packet.count - totalWritten)
       }
       if written < 0 {
         throw CastError.write("Failed to write to stream")
@@ -649,7 +663,8 @@ extension CastClient: StreamDelegate {
       } catch { }
     case Stream.Event.errorOccurred:
       let streamError = aStream.streamError
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
         self.delegate?.castClient(self, connectionTo: self.device, didFailWith: streamError)
       }
     case Stream.Event.hasBytesAvailable:
