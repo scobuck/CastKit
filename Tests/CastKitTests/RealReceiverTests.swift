@@ -163,9 +163,9 @@ final class RealReceiverTests: XCTestCase {
       itemsKnown.fulfill()
     }
     wait(for: [itemsKnown], timeout: 10)
-    let items = try XCTUnwrap(itemsBox.value).get()
-    print("[real] queue items: \(items.map { "\($0.itemId):\($0.customData)" })")
-    XCTAssertEqual(items.map { $0.customData["key"] }, ["first", "second"])
+    let reported = try XCTUnwrap(itemsBox.value).get()
+    print("[real] queue items: \(reported.map { "\($0.itemId):\($0.customData)" })")
+    XCTAssertEqual(reported.map { $0.customData["key"] }, ["first", "second"])
 
     let onSecond = events.expectStatus("second item playing") { $0.currentItemId == secondId && $0.playerState == .playing }
     XCTWaiter().wait(for: [onSecond], timeout: 60)
