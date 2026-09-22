@@ -1,80 +1,81 @@
 import Foundation
-import os
 
-private let maxBufferLength = 8192
-
-class CastV2PlatformReader {
+/// Reads CASTV2 frames — a 4-byte big-endian length, then that many bytes
+/// of protobuf — off an input stream, in whatever pieces they arrive.
+///
+/// The buffer is a plain byte array. It used to be a `Data` that was
+/// compacted with `removeFirst`, after which its indices no longer began
+/// at zero while the reader went on counting from zero — and the first
+/// batch of messages to pass the compaction threshold (a queue status
+/// with a few long URLs will do it) trapped in `subdata(in:)`.
+final class CastV2PlatformReader {
   let stream: InputStream
-  var readPosition = 0
-  var buffer = Data(capacity: maxBufferLength)
-  private var _lock = os_unfair_lock()
+
+  private var buffer: [UInt8] = []
+  private var readPosition = 0
+  private let lock = NSLock()
+
+  /// Bytes already consumed are dropped once they pile up this far.
+  private let compactionThreshold = 8_192
+  /// A frame larger than this is not a Cast message; the connection is
+  /// out of sync and gets a clean slate.
+  private let maxPayloadSize = 1_048_576
 
   init(stream: InputStream) {
     self.stream = stream
   }
 
   func readStream() {
-    os_unfair_lock_lock(&_lock)
-    defer { os_unfair_lock_unlock(&_lock) }
+    readAll(from: stream)
+  }
 
-    let bufferSize = 4096
+  /// Reads everything `source` has available into the buffer.
+  func readAll(from source: InputStream) {
+    lock.lock()
+    defer { lock.unlock() }
 
-    while stream.hasBytesAvailable {
-      var bytes = [UInt8](repeating: 0, count: bufferSize)
-
-      let bytesRead = stream.read(&bytes, maxLength: bufferSize)
-
-      if bytesRead < 0 { continue }
-
-      buffer.append(contentsOf: bytes.prefix(bytesRead))
+    var chunk = [UInt8](repeating: 0, count: 4_096)
+    while source.hasBytesAvailable {
+      let bytesRead = source.read(&chunk, maxLength: chunk.count)
+      if bytesRead <= 0 { break }
+      buffer.append(contentsOf: chunk[0..<bytesRead])
     }
   }
 
   func nextMessage() -> Data? {
-    os_unfair_lock_lock(&_lock)
-    defer { os_unfair_lock_unlock(&_lock) }
+    lock.lock()
+    defer { lock.unlock() }
 
-    let headerSize = MemoryLayout<UInt32>.size
+    let headerSize = 4
     guard buffer.count - readPosition >= headerSize else { return nil }
 
-    let header: UInt32 = buffer.withUnsafeBytes { rawBuffer in
-      rawBuffer.loadUnaligned(fromByteOffset: readPosition, as: UInt32.self)
-    }
+    let p = readPosition
+    let payloadSize = Int(UInt32(buffer[p]) << 24 | UInt32(buffer[p + 1]) << 16 | UInt32(buffer[p + 2]) << 8 | UInt32(buffer[p + 3]))
 
-    let payloadSize = Int(CFSwapInt32BigToHost(header))
-
-    let maxPayloadSize = 1_048_576 // 1 MB
     guard payloadSize <= maxPayloadSize else {
-      // Skip this oversized message
-      buffer.removeAll()
+      buffer.removeAll(keepingCapacity: true)
       readPosition = 0
       return nil
     }
 
-    readPosition += headerSize
+    guard buffer.count - readPosition >= headerSize + payloadSize else { return nil }
 
-    guard buffer.count >= readPosition + payloadSize, payloadSize >= 0 else {
-      readPosition -= headerSize
-      return nil
-    }
+    let start = readPosition + headerSize
+    let payload = Data(buffer[start..<(start + payloadSize)])
+    readPosition = start + payloadSize
 
-    let payload = buffer.subdata(in: readPosition..<(readPosition + payloadSize))
-    readPosition += payloadSize
-
-    resetBufferIfNeeded()
+    compactIfNeeded()
 
     return payload
   }
 
-  private func resetBufferIfNeeded() {
-    guard buffer.count >= maxBufferLength else { return }
-
+  private func compactIfNeeded() {
     if readPosition == buffer.count {
       buffer.removeAll(keepingCapacity: true)
-    } else {
+      readPosition = 0
+    } else if readPosition >= compactionThreshold {
       buffer.removeFirst(readPosition)
+      readPosition = 0
     }
-
-    readPosition = 0
   }
 }
