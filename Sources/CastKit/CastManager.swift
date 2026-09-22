@@ -63,6 +63,16 @@ public class CastManager: ObservableObject {
     /// Something failed — a load the receiver rejected, a lost connection,
     /// the receiver app going away — and the session has been ended.
     public var onCastError: ((CastError) -> Void)?
+    /// The device connection is up. Nothing has been cast yet.
+    public var onCastConnected: (() -> Void)?
+    /// Why the last session ended, when it wasn't the app that ended it.
+    /// Set before `onCastEnded` fires, so its handler can tell.
+    public private(set) var endReason: CastError?
+    /// Whether the receiver was playing when the last session ended.
+    public private(set) var wasPlayingAtEnd = false
+    /// The media length the receiver last reported, when it has reported one.
+    public var mediaDuration: TimeInterval? { lastKnownDuration }
+    private var lastKnownDuration: TimeInterval?
     /// Incremented each time a new media load is initiated, so a reply to
     /// an earlier load is ignored.
     private var loadGeneration: Int = 0
@@ -132,6 +142,7 @@ public class CastManager: ObservableObject {
         if client != nil || isConnected || isConnecting {
             disconnect()
         }
+        endReason = nil
         isConnecting = true
 
         let newClient = CastClient(device: device)
@@ -193,9 +204,20 @@ public class CastManager: ObservableObject {
             autoplay: shouldPlay,
             currentTime: startPosition
         )
+        load(media)
+    }
 
-        isCastPlaying = shouldPlay
+    /// Loads media on the receiver, launching the receiver app first when
+    /// it isn't running. Unlike `castStream`, the media comes in whole and
+    /// the app's own player is left alone.
+    public func load(_ media: CastMedia) {
+        guard let client = client, client.isConnected else {
+            print("[CastManager] load: no client or not connected")
+            return
+        }
+        isCastPlaying = media.autoplay
         playerState = .buffering
+        lastKnownDuration = nil
         loadGeneration += 1
         let generation = loadGeneration
         loadInFlight = true
@@ -261,6 +283,12 @@ public class CastManager: ObservableObject {
         client?.seek(to: Float(seconds))
     }
 
+    /// Stops the media on the receiver; the receiver app stays running.
+    public func stopMedia() {
+        client?.stop()
+        isCastPlaying = false
+    }
+
     /// Request the current media status from the Cast device.
     /// Triggers `onCastPositionUpdated` callback when the response arrives.
     public func requestMediaStatus() {
@@ -276,6 +304,7 @@ public class CastManager: ObservableObject {
     }
 
     public func disconnect() {
+        endReason = nil
         endSession(stopApp: true)
     }
 
@@ -306,6 +335,7 @@ public class CastManager: ObservableObject {
         }
 
         lastMediaStatus = status
+        if let duration = status.duration, duration > 0 { lastKnownDuration = duration }
         castPosition = status.estimatedCurrentTime
         isCastPlaying = status.playerState == .playing || status.playerState == .buffering
         if playerState != status.playerState {
@@ -330,6 +360,7 @@ public class CastManager: ObservableObject {
 
     /// Ends the session over a failure and tells the app.
     private func fail(with error: CastError) {
+        endReason = error
         endSession(stopApp: false)
         onCastError?(error)
     }
@@ -340,6 +371,7 @@ public class CastManager: ObservableObject {
     private func endSession(stopApp: Bool) {
         let hadSession = client != nil || isConnected || isConnecting
         let lastPosition = estimatedPosition
+        wasPlayingAtEnd = isCastPlaying
 
         if stopApp { client?.stopCurrentApp() }
         client?.delegate = nil
@@ -430,6 +462,7 @@ public class CastManager: ObservableObject {
                 manager.isConnected = true
                 manager.connectedDeviceName = device.name
                 manager.connectedDeviceId = device.id
+                manager.onCastConnected?()
                 // Cast what is playing, from where it is. With nothing
                 // loaded, the connection just waits for the next track.
                 if let player = manager.player, player.hasMedia, !manager.streamURL.isEmpty {
