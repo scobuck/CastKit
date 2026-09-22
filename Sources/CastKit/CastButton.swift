@@ -104,10 +104,20 @@ public struct CastDevicePickerSheet: View {
 
             if castManager.availableDevices.isEmpty {
                 VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Searching for Cast devices…")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
+                    if let error = castManager.scanError {
+                        Image(systemName: "wifi.exclamationmark")
+                            .font(.title2)
+                            .foregroundColor(.secondary)
+                        Text(error)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    } else {
+                        ProgressView()
+                        Text("Searching for Cast devices…")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 40)
@@ -139,6 +149,11 @@ public struct CastDevicePickerSheet: View {
             sliderVolume = castManager.castVolume
             castManager.startScanning()
         }
+        .onDisappear {
+            // Browsing costs Wi-Fi and battery; it only needs to run
+            // while there is a list to fill.
+            castManager.stopScanning()
+        }
         .onChange(of: castManager.castVolume) { _, newValue in
             if !isDraggingSlider {
                 sliderVolume = newValue
@@ -147,7 +162,7 @@ public struct CastDevicePickerSheet: View {
     }
 
     private func deviceButton(_ device: CastDevice) -> some View {
-        let isActive = castManager.isConnected && castManager.connectedDeviceName == device.name
+        let isActive = castManager.isConnected && castManager.connectedDeviceId == device.id
 
         return Button(action: {
             if isActive {
@@ -209,17 +224,27 @@ public struct CastDevicePickerSheet: View {
             List {
                 if castManager.availableDevices.isEmpty {
                     VStack(spacing: 12) {
-                        ProgressView()
-                        Text("Searching for Cast devices…")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
+                        if let error = castManager.scanError {
+                            Image(systemName: "wifi.exclamationmark")
+                                .font(.title2)
+                                .foregroundColor(.secondary)
+                            Text(error)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        } else {
+                            ProgressView()
+                            Text("Searching for Cast devices…")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
                     .listRowBackground(Color.clear)
                 } else {
                     ForEach(castManager.availableDevices, id: \.id) { device in
-                        let isActive = castManager.isConnected && castManager.connectedDeviceName == device.name
+                        let isActive = castManager.isConnected && castManager.connectedDeviceId == device.id
 
                         VStack(spacing: 0) {
                             Button(action: {
@@ -286,6 +311,11 @@ public struct CastDevicePickerSheet: View {
         .onAppear {
             sliderVolume = castManager.castVolume
             castManager.startScanning()
+        }
+        .onDisappear {
+            // Browsing costs Wi-Fi and battery; it only needs to run
+            // while there is a list to fill.
+            castManager.stopScanning()
         }
         .onChange(of: castManager.isConnected) { _, connected in
             if connected { dismiss() }

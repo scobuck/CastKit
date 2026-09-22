@@ -25,6 +25,33 @@ public enum CastError: Error, Sendable {
   case request(String)
   case launch(String)
   case load(String)
+  /// The receiver answered a request with a rejection or failure. `type`
+  /// is the receiver's message type (LOAD_FAILED, INVALID_REQUEST, …) and
+  /// `reason` its own reason string, when it gave one.
+  case rejected(type: String, reason: String?)
+  /// The request could not be sent: there is no open connection.
+  case notConnected
+  /// The receiver didn't answer in time.
+  case timeout
+  /// The connection was closed while the request was outstanding.
+  case disconnected
+}
+
+extension CastError: CustomStringConvertible {
+  public var description: String {
+    switch self {
+    case .connection(let s): return "connection: \(s)"
+    case .write(let s): return "write: \(s)"
+    case .session(let s): return "session: \(s)"
+    case .request(let s): return "request: \(s)"
+    case .launch(let s): return "launch: \(s)"
+    case .load(let s): return "load: \(s)"
+    case .rejected(let type, let reason): return "\(type)\(reason.map { " (\($0))" } ?? "")"
+    case .notConnected: return "not connected"
+    case .timeout: return "timed out"
+    case .disconnected: return "disconnected"
+    }
+  }
 }
 
 public class CastRequest: NSObject, @unchecked Sendable {
@@ -57,6 +84,13 @@ public protocol CastClientDelegate: AnyObject {
 
   func castClient(_ client: CastClient, deviceStatusDidChange status: CastStatus)
   func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus)
+  /// The receiver reported that there is no media session any more.
+  func castClient(_ client: CastClient, mediaSessionDidEnd mediaSessionId: Int)
+  /// The receiver app this client had joined is gone — it quit, idled out,
+  /// or another sender replaced it. The connection to the device is still up.
+  func castClient(_ client: CastClient, appSessionDidEnd app: CastApp)
+  /// The receiver reported a media failure on its own, outside any request.
+  func castClient(_ client: CastClient, mediaDidFail error: CastError)
 
 }
 
@@ -68,24 +102,33 @@ public extension CastClientDelegate {
   func castClient(_ client: CastClient, connectionTo device: CastDevice, didFailWith error: Error?) {}
   func castClient(_ client: CastClient, deviceStatusDidChange status: CastStatus) {}
   func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus) {}
+  func castClient(_ client: CastClient, mediaSessionDidEnd mediaSessionId: Int) {}
+  func castClient(_ client: CastClient, appSessionDidEnd app: CastApp) {}
+  func castClient(_ client: CastClient, mediaDidFail error: CastError) {}
 }
 
 public final class CastClient: NSObject, RequestDispatchable, Channelable, @unchecked Sendable {
 
   public let device: CastDevice
   public weak var delegate: CastClientDelegate?
-  public var connectedApp: CastApp?
+  public private(set) var connectedApp: CastApp?
+
+  /// Receivers speak TLS with a self-signed certificate. Tests speak plain
+  /// TCP to a receiver of their own on the loopback interface.
+  public var usesTLS = true
+  /// How long the receiver has to answer the first CONNECT before the
+  /// attempt is given up. A socket that opens but never speaks — a stale
+  /// address, a device on another network — used to count as connected.
+  public var connectTimeout: TimeInterval = 10
 
   public private(set) var currentStatus: CastStatus? {
     didSet {
       guard let status = currentStatus else { return }
 
-      if oldValue != status {
-        DispatchQueue.main.async { [weak self] in
-          guard let self else { return }
-          self.delegate?.castClient(self, deviceStatusDidChange: status)
-          self.statusDidChange?(status)
-        }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, deviceStatusDidChange: status)
+        self.statusDidChange?(status)
       }
     }
   }
@@ -94,12 +137,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     didSet {
       guard let status = currentMediaStatus else { return }
 
-      if oldValue != status {
-        DispatchQueue.main.async { [weak self] in
-          guard let self else { return }
-          self.delegate?.castClient(self, mediaStatusDidChange: status)
-          self.mediaStatusDidChange?(status)
-        }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, mediaStatusDidChange: status)
+        self.mediaStatusDidChange?(status)
       }
     }
   }
@@ -109,11 +150,11 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   public var statusDidChange: ((CastStatus) -> Void)?
   public var mediaStatusDidChange: ((CastMediaStatus) -> Void)?
 
-  private var _lock = os_unfair_lock()
+  private let lock = NSLock()
 
   private func withLock<T>(_ body: () -> T) -> T {
-    os_unfair_lock_lock(&_lock)
-    defer { os_unfair_lock_unlock(&_lock) }
+    lock.lock()
+    defer { lock.unlock() }
     return body()
   }
 
@@ -129,10 +170,12 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   // MARK: - Socket Setup
 
-  public var isConnected = false {
+  public private(set) var isConnected = false {
     didSet {
       if oldValue != isConnected {
         if isConnected {
+          connectWatchdog?.cancel()
+          connectWatchdog = nil
           DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.castClient(self, didConnectTo: self.device)
@@ -159,68 +202,112 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   private var outputStream: OutputStream!
   private var streamRunLoop: CFRunLoop?
-
-  fileprivate lazy var socketQueue = DispatchQueue.global(qos: .userInitiated)
+  private var connectWatchdog: DispatchWorkItem?
+  private var isConnecting = false
+  private var channelsAttached = false
 
   public func connect() {
-    socketQueue.async {
-      do {
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
+    let alreadyStarted: Bool = withLock {
+      if isConnecting || streamRunLoop != nil { return true }
+      isConnecting = true
+      return false
+    }
+    guard !alreadyStarted else { return }
 
+    let watchdog = DispatchWorkItem { [weak self] in
+      guard let self, !self.isConnected else { return }
+      self.failConnection(with: CastError.timeout)
+    }
+    connectWatchdog = watchdog
+    DispatchQueue.global().asyncAfter(deadline: .now() + connectTimeout, execute: watchdog)
+
+    // A thread of its own, not a pooled GCD worker: the run loop below
+    // blocks it for the life of the connection.
+    let thread = Thread { [self] in
+      self.runSocketLoop()
+    }
+    thread.name = "CastKit.socket"
+    thread.qualityOfService = .userInitiated
+    thread.start()
+  }
+
+  private func runSocketLoop() {
+    do {
+      var readStream: Unmanaged<CFReadStream>?
+      var writeStream: Unmanaged<CFWriteStream>?
+
+      CFStreamCreatePairWithSocketToHost(nil, self.device.hostName as CFString, UInt32(self.device.port), &readStream, &writeStream)
+
+      guard let readStreamRetained = readStream?.takeRetainedValue() else {
+        throw CastError.connection("Unable to create input stream")
+      }
+
+      guard let writeStreamRetained = writeStream?.takeRetainedValue() else {
+        throw CastError.connection("Unable to create output stream")
+      }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, willConnectTo: self.device)
+      }
+
+      if usesTLS {
         let settings: [String: Any] = [
           kCFStreamSSLValidatesCertificateChain as String: false,
           kCFStreamSSLLevel as String: kCFStreamSocketSecurityLevelNegotiatedSSL,
         ]
-
-        CFStreamCreatePairWithSocketToHost(nil, self.device.hostName as CFString, UInt32(self.device.port), &readStream, &writeStream)
-
-        guard let readStreamRetained = readStream?.takeRetainedValue() else {
-          throw CastError.connection("Unable to create input stream")
-        }
-
-        guard let writeStreamRetained = writeStream?.takeRetainedValue() else {
-          throw CastError.connection("Unable to create output stream")
-        }
-
-        DispatchQueue.main.async { [weak self] in
-          guard let self else { return }
-          self.delegate?.castClient(self, willConnectTo: self.device)
-        }
-
         CFReadStreamSetProperty(readStreamRetained, CFStreamPropertyKey(kCFStreamPropertySSLSettings), settings as CFTypeRef?)
         CFWriteStreamSetProperty(writeStreamRetained, CFStreamPropertyKey(kCFStreamPropertySSLSettings), settings as CFTypeRef?)
-
-        self.inputStream = readStreamRetained
-        self.outputStream = writeStreamRetained
-
-        self.inputStream.delegate = self
-
-        self.inputStream.schedule(in: .current, forMode: .default)
-        self.outputStream.schedule(in: .current, forMode: .default)
-
-        self.inputStream.open()
-        self.outputStream.open()
-
-        self.streamRunLoop = CFRunLoopGetCurrent()
-        // Blocks this GCD thread to receive stream events. The heartbeat
-        // channel's disconnect timer serves as the connection watchdog and
-        // will call disconnect() (which stops this run loop) on timeout.
-        RunLoop.current.run()
-      } catch {
-        DispatchQueue.main.async { [weak self] in
-          guard let self else { return }
-          self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error as NSError)
-        }
       }
+
+      self.inputStream = readStreamRetained
+      self.outputStream = writeStreamRetained
+
+      self.inputStream.delegate = self
+
+      self.inputStream.schedule(in: .current, forMode: .default)
+      self.outputStream.schedule(in: .current, forMode: .default)
+
+      self.inputStream.open()
+      self.outputStream.open()
+
+      self.streamRunLoop = CFRunLoopGetCurrent()
+      withLock { isConnecting = false }
+      // Blocks this thread to receive stream events; returns once
+      // disconnect() has removed the streams and stopped the loop.
+      RunLoop.current.run()
+    } catch {
+      withLock { isConnecting = false }
+      failConnection(with: error)
     }
   }
 
+  /// The attempt is over: tell the delegate, then tear down whatever was set up.
+  private func failConnection(with error: Error) {
+    connectWatchdog?.cancel()
+    connectWatchdog = nil
+    if isConnected {
+      // Established, then broken: an ordinary disconnect.
+      disconnect()
+      return
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error)
+    }
+    disconnect()
+  }
+
   public func disconnect() {
+    connectWatchdog?.cancel()
+    connectWatchdog = nil
+
     if isConnected {
       isConnected = false
     }
 
+    // Callers waiting on a reply are told, rather than left until their
+    // timeouts — which were cancelled here, so they were never told.
     let handlers = withLock {
       let h = responseHandlers
       responseHandlers.removeAll()
@@ -229,10 +316,20 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     for (_, entry) in handlers {
       entry.timeout.cancel()
     }
+    if !handlers.isEmpty {
+      DispatchQueue.main.async {
+        for (_, entry) in handlers {
+          entry.handler(.failure(.disconnected))
+        }
+      }
+    }
 
     withLock { channels }.values.forEach(remove)
+    channelsAttached = false
+    connectedApp = nil
 
     if let runLoop = streamRunLoop {
+      streamRunLoop = nil
       CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
         if self.inputStream != nil {
           self.inputStream.close()
@@ -249,8 +346,8 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         CFRunLoopStop(CFRunLoopGetCurrent())
       }
       CFRunLoopWakeUp(runLoop)
-      streamRunLoop = nil
     }
+    withLock { isConnecting = false }
   }
 
   // MARK: - Socket Lifecycle
@@ -281,69 +378,78 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
   }
 
+  /// Attaches the channels; each one introduces itself as it attaches
+  /// (CONNECT, GET_STATUS, PING).
+  fileprivate func attachChannels() {
+    guard outputStream != nil, !channelsAttached else { return }
+    channelsAttached = true
 
-  fileprivate func sendConnectMessage() throws {
-    guard outputStream != nil else { return }
-
-    _ = connectionChannel
-    _ = receiverControlChannel
-    _ = mediaControlChannel
-    _ = heartbeatChannel
+    add(channel: connectionChannel)
+    add(channel: receiverControlChannel)
+    add(channel: mediaControlChannel)
+    add(channel: heartbeatChannel)
 
     if device.capabilities.contains(.multizoneGroup) {
-      _ = multizoneControlChannel
+      add(channel: multizoneControlChannel)
     }
   }
 
   private var reader: CastV2PlatformReader?
 
   fileprivate func readStream() {
-    do {
-      reader?.readStream()
+    reader?.readStream()
 
-      var pendingResponses = [(Int, Result<JSON, CastError>)]()
+    var pendingResponses = [(Int, Result<JSON, CastError>)]()
 
-      while let payload = reader?.nextMessage() {
-        let message = try CastMessage(serializedData: payload)
-
-        guard let channel = withLock({ channels[message.namespace] }) else { return }
-
-        switch message.payloadType {
-        case .string:
-          let json = JSON(parseJSON: message.payloadUtf8)
-
-          channel.handleResponse(json,
-                                 sourceId: message.sourceID)
-
-          if let requestId = json[CastJSONPayloadKeys.requestId].int {
-            pendingResponses.append((requestId, .success(json)))
-          }
-        case .binary:
-          channel.handleResponse(message.payloadBinary,
-                                 sourceId: message.sourceID)
-        }
+    while let payload = reader?.nextMessage() {
+      let message: CastMessage
+      do {
+        message = try CastMessage(serializedData: payload)
+      } catch {
+        // One bad frame is one bad frame; the ones behind it are fine.
+        #if DEBUG
+        print("[CastKit] Failed to parse message: \(error)")
+        #endif
+        continue
       }
 
-      if !pendingResponses.isEmpty {
-        let entriesToDispatch: [(CastResponseHandler, Result<JSON, CastError>)] = pendingResponses.compactMap { (requestId, result) in
-          let entry = withLock { self.responseHandlers.removeValue(forKey: requestId) }
-          entry?.timeout.cancel()
-          guard let handler = entry?.handler else { return nil }
-          return (handler, result)
-        }
+      // Receivers also talk on namespaces this client never registers
+      // (Nest devices especially). Those messages are skipped, not the
+      // rest of the batch — a `return` here left later messages and their
+      // waiting callers stranded.
+      guard let channel = withLock({ channels[message.namespace] }) else { continue }
 
-        if !entriesToDispatch.isEmpty {
-          DispatchQueue.main.async {
-            for (handler, result) in entriesToDispatch {
-              handler(result)
-            }
+      switch message.payloadType {
+      case .string:
+        let json = JSON(parseJSON: message.payloadUtf8)
+
+        channel.handleResponse(json,
+                               sourceId: message.sourceID)
+
+        if let requestId = json[CastJSONPayloadKeys.requestId].int, requestId != 0 {
+          pendingResponses.append((requestId, .success(json)))
+        }
+      case .binary:
+        channel.handleResponse(message.payloadBinary,
+                               sourceId: message.sourceID)
+      }
+    }
+
+    if !pendingResponses.isEmpty {
+      let entriesToDispatch: [(CastResponseHandler, Result<JSON, CastError>)] = pendingResponses.compactMap { (requestId, result) in
+        let entry = withLock { self.responseHandlers.removeValue(forKey: requestId) }
+        entry?.timeout.cancel()
+        guard let handler = entry?.handler else { return nil }
+        return (handler, result)
+      }
+
+      if !entriesToDispatch.isEmpty {
+        DispatchQueue.main.async {
+          for (handler, result) in entriesToDispatch {
+            handler(result)
           }
         }
       }
-    } catch {
-      #if DEBUG
-      print("CastClient: Failed to parse message: \(error)")
-      #endif
     }
   }
 
@@ -351,40 +457,29 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   var channels = [String: CastChannel]()
 
-  private lazy var heartbeatChannel: HeartbeatChannel = {
-    let channel = HeartbeatChannel()
-    self.add(channel: channel)
+  /// The channel table is read on the socket thread and changed from
+  /// whichever thread connects or disconnects, so both sides take the lock.
+  func add(channel: CastChannel) {
+    let added: Bool = withLock {
+      guard channels[channel.namespace] == nil else { return false }
+      channels[channel.namespace] = channel
+      return true
+    }
+    if added {
+      channel.requestDispatcher = self
+    }
+  }
 
-    return channel
-  }()
+  func remove(channel: CastChannel) {
+    let removed = withLock { channels.removeValue(forKey: channel.namespace) }
+    removed?.requestDispatcher = nil
+  }
 
-  private lazy var connectionChannel: DeviceConnectionChannel = {
-    let channel = DeviceConnectionChannel()
-    self.add(channel: channel)
-
-    return channel
-  }()
-
-  private lazy var receiverControlChannel: ReceiverControlChannel = {
-    let channel = ReceiverControlChannel()
-    self.add(channel: channel)
-
-    return channel
-  }()
-
-  private lazy var mediaControlChannel: MediaControlChannel = {
-    let channel = MediaControlChannel()
-    self.add(channel: channel)
-
-    return channel
-  }()
-
-  private lazy var multizoneControlChannel: MultizoneControlChannel = {
-    let channel = MultizoneControlChannel()
-    self.add(channel: channel)
-
-    return channel
-  }()
+  private let heartbeatChannel = HeartbeatChannel()
+  private let connectionChannel = DeviceConnectionChannel()
+  private let receiverControlChannel = ReceiverControlChannel()
+  private let mediaControlChannel = MediaControlChannel()
+  private let multizoneControlChannel = MultizoneControlChannel()
 
   // MARK: - Request response
 
@@ -408,7 +503,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         let handler = self.withLock { self.responseHandlers.removeValue(forKey: request.id)?.handler }
         if let handler = handler {
           DispatchQueue.main.async {
-            handler(.failure(.request("Request timed out")))
+            handler(.failure(.timeout))
           }
         }
       }
@@ -424,7 +519,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
                                                        destinationId: request.destinationId)
 
       guard let runLoop = streamRunLoop else {
-        callResponseHandler(for: requestId, with: .failure(.request("Not connected")))
+        callResponseHandler(for: requestId, with: .failure(.notConnected))
         return
       }
 
@@ -454,14 +549,20 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   // MARK: - Public messages
 
   public func getAppAvailability(apps: [CastApp], completion: @escaping @Sendable (Result<AppAvailability, CastError>) -> Void) {
-    guard outputStream != nil else { return }
+    guard outputStream != nil else {
+      completion(.failure(.notConnected))
+      return
+    }
 
     receiverControlChannel.getAppAvailability(apps: apps, completion: completion)
   }
 
   public func join(app: CastApp? = nil, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
-    guard outputStream != nil,
-      let target = app ?? currentStatus?.apps.first else {
+    guard outputStream != nil else {
+      completion(.failure(.notConnected))
+      return
+    }
+    guard let target = app ?? currentStatus?.apps.first else {
       completion(.failure(CastError.session("No Apps Running")))
       return
     }
@@ -475,7 +576,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       receiverControlChannel.requestStatus { [weak self] result in
         switch result {
         case .success(let status):
-          guard let app = status.apps.first else {
+          guard let app = status.apps.first(where: { $0.id == target.id }) ?? status.apps.first else {
             completion(.failure(CastError.launch("Unable to get launched app instance")))
             return
           }
@@ -491,7 +592,10 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func launch(appId: String, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
-    guard outputStream != nil else { return }
+    guard outputStream != nil else {
+      completion(.failure(.notConnected))
+      return
+    }
 
     receiverControlChannel.launch(appId: appId) { [weak self] result in
       switch result {
@@ -505,10 +609,14 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
   }
 
+  /// Stops the receiver app this client launched or joined — not whatever
+  /// app happens to be listed first, which could be another sender's.
   public func stopCurrentApp() {
-    guard outputStream != nil, let app = currentStatus?.apps.first else { return }
+    guard outputStream != nil, let app = connectedApp else { return }
 
     receiverControlChannel.stop(app: app)
+    connectedApp = nil
+    currentMediaStatus = nil
   }
 
   public func leave(_ app: CastApp) {
@@ -519,15 +627,21 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func load(media: CastMedia, with app: CastApp, completion: @escaping @Sendable (Result<CastMediaStatus, CastError>) -> Void) {
-    guard outputStream != nil else { return }
+    guard outputStream != nil else {
+      completion(.failure(.notConnected))
+      return
+    }
 
     mediaControlChannel.load(media: media, with: app, completion: completion)
   }
 
   public func requestMediaStatus(for app: CastApp, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
-    guard outputStream != nil else { return }
+    guard outputStream != nil else {
+      completion?(.failure(.notConnected))
+      return
+    }
 
-    mediaControlChannel.requestMediaStatus(for: app)
+    mediaControlChannel.requestMediaStatus(for: app, completion: completion)
   }
 
   private func connect(to app: CastApp) {
@@ -537,83 +651,51 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     connectedApp = app
   }
 
-  public func pause() {
-    guard outputStream != nil, let app = connectedApp else { return }
+  /// Runs `command` with the current media session, fetching the status
+  /// first if none is known yet.
+  private func withMediaSession(completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)?,
+                                _ command: @escaping @Sendable (CastApp, Int) -> Void) {
+    guard outputStream != nil, let app = connectedApp else {
+      completion?(.failure(.notConnected))
+      return
+    }
 
-    if let mediaStatus = currentMediaStatus {
-      mediaControlChannel.sendPause(for: app, mediaSessionId: mediaStatus.mediaSessionId)
+    if let mediaStatus = currentMediaStatus, mediaStatus.hasMediaSession {
+      command(app, mediaStatus.mediaSessionId)
     } else {
       mediaControlChannel.requestMediaStatus(for: app) { result in
         switch result {
         case .success(let mediaStatus):
-          self.mediaControlChannel.sendPause(for: app, mediaSessionId: mediaStatus.mediaSessionId)
+          command(app, mediaStatus.mediaSessionId)
 
         case .failure(let error):
-          #if DEBUG
-          print(error)
-          #endif
+          completion?(.failure(error))
         }
       }
     }
   }
 
-  public func play() {
-    guard outputStream != nil, let app = connectedApp else { return }
-
-    if let mediaStatus = currentMediaStatus {
-      mediaControlChannel.sendPlay(for: app, mediaSessionId: mediaStatus.mediaSessionId)
-    } else {
-      mediaControlChannel.requestMediaStatus(for: app) { result in
-        switch result {
-        case .success(let mediaStatus):
-          self.mediaControlChannel.sendPlay(for: app, mediaSessionId: mediaStatus.mediaSessionId)
-
-        case .failure(let error):
-          #if DEBUG
-          print(error)
-          #endif
-        }
-      }
+  public func pause(completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendPause(for: app, mediaSessionId: sessionId, completion: completion)
     }
   }
 
-  public func stop() {
-    guard outputStream != nil, let app = connectedApp else { return }
-
-    if let mediaStatus = currentMediaStatus {
-      mediaControlChannel.sendStop(for: app, mediaSessionId: mediaStatus.mediaSessionId)
-    } else {
-      mediaControlChannel.requestMediaStatus(for: app) { result in
-        switch result {
-        case .success(let mediaStatus):
-          self.mediaControlChannel.sendStop(for: app, mediaSessionId: mediaStatus.mediaSessionId)
-
-        case .failure(let error):
-          #if DEBUG
-          print(error)
-          #endif
-        }
-      }
+  public func play(completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendPlay(for: app, mediaSessionId: sessionId, completion: completion)
     }
   }
 
-  public func seek(to currentTime: Float) {
-    guard outputStream != nil, let app = connectedApp else { return }
+  public func stop(completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendStop(for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
 
-    if let mediaStatus = currentMediaStatus {
-      mediaControlChannel.sendSeek(to: currentTime, for: app, mediaSessionId: mediaStatus.mediaSessionId)
-    } else {
-      mediaControlChannel.requestMediaStatus(for: app) { result in
-        switch result {
-        case .success(let mediaStatus):
-          self.mediaControlChannel.sendSeek(to: currentTime, for: app, mediaSessionId: mediaStatus.mediaSessionId)
-
-        case .failure(let error):
-          #if DEBUG
-          print(error)
-          #endif
-        }
-      }
+  public func seek(to currentTime: Float, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendSeek(to: currentTime, for: app, mediaSessionId: sessionId, completion: completion)
     }
   }
 
@@ -656,17 +738,11 @@ extension CastClient: StreamDelegate {
   public func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
     switch eventCode {
     case Stream.Event.openCompleted:
-      guard !isConnected else { return }
-      do {
-        try self.sendConnectMessage()
-        self.isConnected = true
-      } catch { }
+      // The socket is open; "connected" waits for the receiver's first
+      // word (its status, or a heartbeat).
+      attachChannels()
     case Stream.Event.errorOccurred:
-      let streamError = aStream.streamError
-      DispatchQueue.main.async { [weak self] in
-        guard let self else { return }
-        self.delegate?.castClient(self, connectionTo: self.device, didFailWith: streamError)
-      }
+      failConnection(with: aStream.streamError ?? CastError.connection("Stream error"))
     case Stream.Event.hasBytesAvailable:
       self.readStream()
     case Stream.Event.endEncountered:
@@ -679,13 +755,58 @@ extension CastClient: StreamDelegate {
 
 extension CastClient: ReceiverControlChannelDelegate {
   func channel(_ channel: ReceiverControlChannel, didReceive status: CastStatus) {
+    // The app this client joined has to still be running. Gone from the
+    // list — it quit, idled out, or another sender took the device — its
+    // transport id is dead, and requests to it would only time out.
+    if let app = connectedApp, !status.apps.contains(where: { $0.sessionId == app.sessionId }) {
+      connectedApp = nil
+      currentMediaStatus = nil
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, appSessionDidEnd: app)
+      }
+    }
     currentStatus = status
+    if !isConnected {
+      isConnected = true
+    }
   }
 }
 
 extension CastClient: MediaControlChannelDelegate {
   func channel(_ channel: MediaControlChannel, didReceive mediaStatus: CastMediaStatus) {
     currentMediaStatus = mediaStatus
+  }
+
+  func channelDidReportNoMediaSession(_ channel: MediaControlChannel) {
+    let ended = currentMediaStatus?.mediaSessionId ?? 0
+    currentMediaStatus = nil
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.delegate?.castClient(self, mediaSessionDidEnd: ended)
+    }
+  }
+
+  func channel(_ channel: MediaControlChannel, didReceiveError error: CastError) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.delegate?.castClient(self, mediaDidFail: error)
+    }
+  }
+}
+
+extension CastClient: DeviceConnectionChannelDelegate {
+  func channel(_ channel: DeviceConnectionChannel, didReceiveCloseFrom sourceId: String) {
+    if sourceId == CastConstants.receiver {
+      disconnect()
+    } else if let app = connectedApp, sourceId == app.transportId {
+      connectedApp = nil
+      currentMediaStatus = nil
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, appSessionDidEnd: app)
+      }
+    }
   }
 }
 
@@ -697,10 +818,13 @@ extension CastClient: HeartbeatChannelDelegate {
   }
 
   func channelDidTimeout(_ channel: HeartbeatChannel) {
-    disconnect()
     currentStatus = nil
     currentMediaStatus = nil
-    connectedApp = nil
+    if isConnected {
+      disconnect()
+    } else {
+      failConnection(with: CastError.timeout)
+    }
   }
 }
 

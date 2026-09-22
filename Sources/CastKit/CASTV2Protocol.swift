@@ -39,6 +39,25 @@ enum CastMessageType: String {
   case deviceRemoved = "DEVICE_REMOVED"
   case invalidRequest = "INVALID_REQUEST"
   case mdxSessionStatus = "mdxSessionStatus"
+  // Error replies. The receiver answers a bad or failed request with one
+  // of these instead of the status it was asked for; they used to fall
+  // through as "unknown type" and the caller waited for a reply that had
+  // already come.
+  case loadFailed = "LOAD_FAILED"
+  case loadCancelled = "LOAD_CANCELLED"
+  case launchError = "LAUNCH_ERROR"
+  case invalidPlayerState = "INVALID_PLAYER_STATE"
+  case error = "ERROR"
+
+  /// Whether this message is the receiver rejecting or failing a request.
+  var isError: Bool {
+    switch self {
+    case .loadFailed, .loadCancelled, .launchError, .invalidPlayerState, .invalidRequest, .error:
+      return true
+    default:
+      return false
+    }
+  }
 }
 
 struct CastJSONPayloadKeys {
@@ -80,6 +99,11 @@ struct CastJSONPayloadKeys {
   static let device = "device"
   static let devices = "devices"
   static let capabilities = "capabilities"
+  static let reason = "reason"
+  static let idleReason = "idleReason"
+  static let duration = "duration"
+  static let supportedMediaCommands = "supportedMediaCommands"
+  static let customData = "customData"
 }
 
 struct CastConstants {

@@ -19,12 +19,11 @@ class ReceiverControlChannel: CastChannel {
   }
 
   override func handleResponse(_ json: JSON, sourceId: String) {
-    guard let rawType = json["type"].string else { return }
+    guard let rawType = json[CastJSONPayloadKeys.type].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
       #if DEBUG
-      print("Unknown type: \(rawType)")
-      print(json)
+      print("[CastKit] receiver: unknown message type \(rawType)")
       #endif
       return
     }
@@ -34,10 +33,17 @@ class ReceiverControlChannel: CastChannel {
       delegate?.channel(self, didReceive: CastStatus(json: json))
 
     default:
-      #if DEBUG
-      print(rawType)
-      #endif
+      break
     }
+  }
+
+  /// Reads a reply as a receiver status, or as the receiver's rejection.
+  static func receiverStatus(from json: JSON) -> Result<CastStatus, CastError> {
+    let rawType = json[CastJSONPayloadKeys.type].string ?? ""
+    guard CastMessageType(rawValue: rawType) == .status else {
+      return .failure(.rejected(type: rawType, reason: json[CastJSONPayloadKeys.reason].string))
+    }
+    return .success(CastStatus(json: json))
   }
 
   public func getAppAvailability(apps: [CastApp], completion: @escaping @Sendable (Result<AppAvailability, CastError>) -> Void) {
@@ -53,9 +59,14 @@ class ReceiverControlChannel: CastChannel {
     send(request) { result in
       switch result {
       case .success(let json):
-        completion(.success(AppAvailability(json: json)))
+        let rawType = json[CastJSONPayloadKeys.type].string ?? ""
+        if let type = CastMessageType(rawValue: rawType), type.isError {
+          completion(.failure(.rejected(type: rawType, reason: json[CastJSONPayloadKeys.reason].string)))
+        } else {
+          completion(.success(AppAvailability(json: json)))
+        }
       case .failure(let error):
-        completion(.failure(CastError.launch(error.localizedDescription)))
+        completion(.failure(error))
       }
     }
   }
@@ -69,7 +80,7 @@ class ReceiverControlChannel: CastChannel {
       send(request) { result in
         switch result {
         case .success(let json):
-          completion(.success(CastStatus(json: json)))
+          completion(Self.receiverStatus(from: json))
 
         case .failure(let error):
           completion(.failure(error))
@@ -93,17 +104,21 @@ class ReceiverControlChannel: CastChannel {
     send(request) { result in
       switch result {
       case .success(let json):
-        guard let app = CastStatus(json: json).apps.first else {
-          completion(.failure(CastError.launch("Unable to get launched app instance")))
-          return
+        switch Self.receiverStatus(from: json) {
+        case .success(let status):
+          // The one we asked for, not whatever happens to be listed first.
+          guard let app = status.apps.first(where: { $0.id == appId }) ?? status.apps.first else {
+            completion(.failure(CastError.launch("Unable to get launched app instance")))
+            return
+          }
+          completion(.success(app))
+        case .failure(let error):
+          completion(.failure(error))
         }
-
-        completion(.success(app))
 
       case .failure(let error):
         completion(.failure(error))
       }
-
     }
   }
 

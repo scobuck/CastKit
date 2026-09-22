@@ -60,8 +60,10 @@ public final class CastDeviceScanner: @unchecked Sendable {
     setupAndStartBrowser()
   }
 
+  /// Stops browsing. The devices found so far are kept, so a picker
+  /// reopened a moment later shows them at once.
   public func stopScanning() {
-    guard isScanning else { return }
+    guard isScanning || browser != nil else { return }
 
     browser?.cancel()
     browser = nil
@@ -88,7 +90,10 @@ public final class CastDeviceScanner: @unchecked Sendable {
 
   private func setupAndStartBrowser() {
     let params = NWParameters()
-    params.includePeerToPeer = true
+    // Cast devices sit on the infrastructure network. Peer-to-peer
+    // (AWDL) browsing finds nothing extra and costs Wi-Fi throughput and
+    // battery for as long as the browser runs.
+    params.includePeerToPeer = false
 
     let newBrowser = NWBrowser(for: .bonjour(type: "_googlecast._tcp.", domain: "local."), using: params)
 
@@ -100,11 +105,20 @@ public final class CastDeviceScanner: @unchecked Sendable {
         #if DEBUG
           NSLog("[CastKit] NWBrowser ready")
         #endif
+      case .waiting(let error):
+        // Browsing can't proceed — local network access denied, or no
+        // network. Left as "searching…" forever, nobody knew.
+        self.isScanning = false
+        #if DEBUG
+          NSLog("[CastKit] NWBrowser waiting: \(error)")
+        #endif
+        self.delegate?.scannerDidFail(Self.describe(error))
       case .failed(let error):
         self.isScanning = false
         #if DEBUG
           NSLog("[CastKit] NWBrowser failed: \(error)")
         #endif
+        self.delegate?.scannerDidFail(Self.describe(error))
       case .cancelled:
         self.isScanning = false
       default:
@@ -132,6 +146,13 @@ public final class CastDeviceScanner: @unchecked Sendable {
 
     newBrowser.start(queue: .main)
     self.browser = newBrowser
+  }
+
+  private static func describe(_ error: NWError) -> String {
+    if case .dns(let code) = error, code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied) {
+      return "Local network access is off for this app. Turn it on in Settings › Privacy & Security › Local Network."
+    }
+    return "Can't search for Cast devices right now (\(error.localizedDescription))."
   }
 
   // MARK: - Browse Result Handling
@@ -293,4 +314,10 @@ public protocol CastDeviceScannerDelegate: AnyObject {
   func deviceDidComeOnline(_ device: CastDevice)
   func deviceDidChange(_ device: CastDevice)
   func deviceDidGoOffline(_ device: CastDevice)
+  /// Browsing can't proceed; `message` says why, in words for the user.
+  func scannerDidFail(_ message: String)
+}
+
+public extension CastDeviceScannerDelegate {
+  func scannerDidFail(_ message: String) {}
 }

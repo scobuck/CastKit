@@ -2,26 +2,22 @@ import Foundation
 // SwiftyJSON is vendored in the same module
 
 class HeartbeatChannel: CastChannel {
-  private lazy var timer = Timer.scheduledTimer(timeInterval: 5, target: self, selector: #selector(sendPing), userInfo: nil, repeats: true)
-
+  private let pingInterval: TimeInterval = 5
   private let disconnectTimeout: TimeInterval = 10
-  private var disconnectTimer: Timer? {
-    willSet {
-      disconnectTimer?.invalidate()
-    }
-    didSet {
-      guard let timer = disconnectTimer else { return }
 
-      RunLoop.main.add(timer, forMode: .common)
-    }
-  }
+  /// Timers live on their own queue rather than a run loop: they are
+  /// started on the socket thread and stopped from whichever thread
+  /// disconnects, which a run-loop timer does not allow.
+  private let timerQueue = DispatchQueue(label: "CastKit.heartbeat")
+  private var pingSource: DispatchSourceTimer?
+  private var watchdog: DispatchWorkItem?
 
   override weak var requestDispatcher: RequestDispatchable! {
     didSet {
       if requestDispatcher != nil {
         startBeating()
       } else {
-        timer.invalidate()
+        stopBeating()
       }
     }
   }
@@ -34,56 +30,79 @@ class HeartbeatChannel: CastChannel {
     super.init(namespace: CastNamespace.heartbeat)
   }
 
+  deinit {
+    pingSource?.cancel()
+    watchdog?.cancel()
+  }
+
   override func handleResponse(_ json: JSON, sourceId: String) {
     delegate?.channelDidConnect(self)
 
-    guard let rawType = json["type"].string else { return }
+    guard let rawType = json[CastJSONPayloadKeys.type].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
       #if DEBUG
-      print("Unknown type: \(rawType)")
-      print(json)
+      print("[CastKit] heartbeat: unknown message type \(rawType)")
       #endif
       return
     }
 
     if type == .ping {
       sendPong(to: sourceId)
-      #if DEBUG
-      print("PING from \(sourceId)")
-      #endif
     }
 
-    disconnectTimer = Timer(timeInterval: disconnectTimeout,
-                            target: self,
-                            selector: #selector(handleTimeout),
-                            userInfo: nil,
-                            repeats: false)
+    armWatchdog()
+  }
+
+  /// Nothing heard for the timeout means the receiver is gone. The watchdog
+  /// is armed before anything has been heard, so a socket that opens but
+  /// never speaks — a stale address, a device on another network — is
+  /// given up on rather than held "connected" for good.
+  private func armWatchdog() {
+    watchdog?.cancel()
+    let item = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.delegate?.channelDidTimeout(self)
+    }
+    watchdog = item
+    timerQueue.asyncAfter(deadline: .now() + disconnectTimeout, execute: item)
   }
 
   private func startBeating() {
-    _ = timer
+    armWatchdog()
+    let source = DispatchSource.makeTimerSource(queue: timerQueue)
+    source.schedule(deadline: .now() + pingInterval, repeating: pingInterval)
+    source.setEventHandler { [weak self] in
+      self?.sendPing()
+    }
+    source.resume()
+    pingSource = source
     sendPing()
   }
 
-  @objc private func sendPing() {
-    let request = requestDispatcher.request(withNamespace: namespace,
-                                       destinationId: CastConstants.transport,
-                                       payload: [CastJSONPayloadKeys.type: CastMessageType.ping.rawValue])
+  private func stopBeating() {
+    pingSource?.cancel()
+    pingSource = nil
+    watchdog?.cancel()
+    watchdog = nil
+  }
+
+  private func sendPing() {
+    guard let dispatcher = requestDispatcher else { return }
+    let request = dispatcher.request(withNamespace: namespace,
+                                     destinationId: CastConstants.transport,
+                                     payload: [CastJSONPayloadKeys.type: CastMessageType.ping.rawValue])
 
     send(request)
   }
 
   private func sendPong(to destinationId: String) {
-    let request = requestDispatcher.request(withNamespace: namespace,
-                                 destinationId: destinationId,
-                                 payload: [CastJSONPayloadKeys.type: CastMessageType.pong.rawValue])
+    guard let dispatcher = requestDispatcher else { return }
+    let request = dispatcher.request(withNamespace: namespace,
+                                     destinationId: destinationId,
+                                     payload: [CastJSONPayloadKeys.type: CastMessageType.pong.rawValue])
 
     send(request)
-  }
-
-  @objc private func handleTimeout() {
-    delegate?.channelDidTimeout(self)
   }
 }
 

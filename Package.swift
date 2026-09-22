@@ -20,5 +20,9 @@ let package = Package(
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ]
         ),
+        .testTarget(
+            name: "CastKitTests",
+            dependencies: ["CastKit"]
+        ),
     ]
 )

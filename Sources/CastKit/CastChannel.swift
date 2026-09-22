@@ -19,7 +19,14 @@ open class CastChannel: NSObject {
     #endif
   }
 
+  /// Sends through the client this channel is attached to. A channel that
+  /// has been detached — the client disconnected while a timer or a late
+  /// caller still held it — answers "not connected" instead of trapping.
   public func send(_ request: CastRequest, response: CastResponseHandler? = nil) {
-    requestDispatcher.send(request, response: response)
+    guard let dispatcher = requestDispatcher else {
+      response?(.failure(.notConnected))
+      return
+    }
+    dispatcher.send(request, response: response)
   }
 }

@@ -5,19 +5,36 @@ import SwiftUI
 public class CastManager: ObservableObject {
     @Published public var availableDevices: [CastDevice] = []
     @Published public var isConnected = false
+    /// A connection attempt is in progress.
+    @Published public var isConnecting = false
     @Published public var connectedDeviceName: String?
+    @Published public var connectedDeviceId: String?
+    /// Whether the receiver is playing (or buffering towards playing), as
+    /// the receiver itself reports it — including changes made elsewhere,
+    /// from the Home app or by voice.
     @Published public var isCastPlaying = false
+    /// The receiver's player state, as last reported.
+    @Published public var playerState: CastMediaPlayerState = .idle
     @Published public var castVolume: Float = 1.0
     /// Last known playback position on the Cast device (seconds).
     @Published public var castPosition: TimeInterval = 0
     /// Whether the current track's codec is natively supported by Cast devices.
     @Published public var isCurrentTrackCastCompatible = true
+    /// Why discovery can't find devices, when it can't: local network
+    /// access denied, no network. Nil while scanning works.
+    @Published public var scanError: String?
 
     private let scanner = CastDeviceScanner()
     private var client: CastClient?
     private var currentApp: CastApp?
     private var scannerDelegate: ScannerDelegate?
     private var clientDelegate: ClientDelegate?
+    private var lastMediaStatus: CastMediaStatus?
+    /// Set while a LOAD is outstanding: idle reports arriving then belong
+    /// to the media being replaced, not to the new one.
+    private var loadInFlight = false
+    /// Whether this manager has muted the app's player for the session.
+    private var playerMuted = false
 
     /// The stream URL to cast — set by the app before calling castStream().
     public var streamURL: String = ""
@@ -25,17 +42,35 @@ public class CastManager: ObservableObject {
     public var stationName: String = ""
     /// The MIME content type for the stream (e.g. "audio/flac", "audio/mpeg").
     public var contentType: String = "audio/mpeg"
+    /// Buffered for tracks; live for radio streams.
+    public var streamType: CastMediaStreamType = .buffered
     /// The position (seconds) to start playback from when loading media.
     public var startPosition: TimeInterval = 0
     /// Reference to the local player for pausing/resuming during Cast.
     public weak var player: (any CastablePlayer)?
-    /// Called when casting ends with the last known cast playback position.
+    /// Called when casting ends with the receiver's last known playback
+    /// position — before the local player is unmuted, so the app can move
+    /// it while it is still silent.
     public var onCastEnded: ((TimeInterval) -> Void)?
     /// Called when the cast device reports an updated playback position.
     public var onCastPositionUpdated: ((TimeInterval) -> Void)?
-    /// Incremented each time a new media load is initiated; used to discard
-    /// stale IDLE status updates from a previous track's media session.
-    nonisolated(unsafe) var loadGeneration: Int = 0
+    /// The receiver's player changed state — playing, paused, buffering,
+    /// idle — including changes made elsewhere.
+    public var onCastStateChanged: ((CastMediaPlayerState) -> Void)?
+    /// The receiver's media went idle: it finished, was stopped, or failed.
+    /// Not called for media replaced by a new load.
+    public var onCastIdle: ((CastIdleReason?) -> Void)?
+    /// Something failed — a load the receiver rejected, a lost connection,
+    /// the receiver app going away — and the session has been ended.
+    public var onCastError: ((CastError) -> Void)?
+    /// Incremented each time a new media load is initiated, so a reply to
+    /// an earlier load is ignored.
+    private var loadGeneration: Int = 0
+
+    /// The receiver's position now, extrapolated only while it is playing.
+    public var estimatedPosition: TimeInterval {
+        lastMediaStatus?.estimatedCurrentTime ?? castPosition
+    }
 
     public init() {
         scannerDelegate = ScannerDelegate(manager: self)
@@ -80,10 +115,12 @@ public class CastManager: ObservableObject {
     }
 
     public func startScanning() {
+        scanError = nil
         scanner.startScanning()
     }
 
     public func restartScanning() {
+        scanError = nil
         scanner.restartScanning()
     }
 
@@ -92,7 +129,10 @@ public class CastManager: ObservableObject {
     }
 
     public func connect(to device: CastDevice) {
-        disconnect()
+        if client != nil || isConnected || isConnecting {
+            disconnect()
+        }
+        isConnecting = true
 
         let newClient = CastClient(device: device)
         let delegate = ClientDelegate(manager: self)
@@ -103,17 +143,11 @@ public class CastManager: ObservableObject {
     }
 
     public func toggleCastPlayback() {
-        guard let client = client else { return }
         if isCastPlaying {
-            client.pause()
-            isCastPlaying = false
-            player?.pause()
+            pauseCast()
         } else {
-            client.play()
-            isCastPlaying = true
-            player?.muteForCast()
+            resumeCast()
         }
-        player?.updateNowPlayingInfo()
     }
 
     public func setCastVolume(_ volume: Float) {
@@ -121,22 +155,33 @@ public class CastManager: ObservableObject {
         client?.setVolume(volume)
     }
 
-    public func castStream() {
+    /// Loads `streamURL` on the receiver. With nothing to cast — no URL,
+    /// or a player with nothing loaded — it does nothing; it used to load
+    /// whatever URL was set last. The receiver starts playing or paused to
+    /// match the player, unless `autoplay` says otherwise.
+    public func castStream(autoplay: Bool? = nil) {
         guard let client = client, client.isConnected else {
             print("[CastManager] castStream: no client or not connected")
             return
         }
-        guard let url = URL(string: streamURL) else {
-            print("[CastManager] castStream: invalid stream URL: \(streamURL.prefix(80))")
+        guard !streamURL.isEmpty, let url = URL(string: streamURL) else {
+            print("[CastManager] castStream: no stream to cast")
             return
         }
+        if let player, !player.hasMedia {
+            print("[CastManager] castStream: player has nothing loaded")
+            return
+        }
+
+        muteLocalPlayer()
 
         let trackTitle = player?.trackTitle
         let artistName = player?.artistName
         let artworkURL = player?.albumArtworkURL
 
-        let displayTitle = trackTitle ?? stationName
+        let displayTitle = (trackTitle?.isEmpty == false) ? trackTitle! : stationName
         let displayArtist = (artistName?.isEmpty == false) ? artistName : nil
+        let shouldPlay = autoplay ?? (player?.isPlaying ?? true)
 
         let media = CastMedia(
             title: displayTitle,
@@ -144,44 +189,48 @@ public class CastManager: ObservableObject {
             url: url,
             poster: artworkURL,
             contentType: contentType,
-            streamType: .buffered,
-            autoplay: true,
+            streamType: streamType,
+            autoplay: shouldPlay,
             currentTime: startPosition
         )
 
-        isCastPlaying = true
+        isCastPlaying = shouldPlay
+        playerState = .buffering
         loadGeneration += 1
+        let generation = loadGeneration
+        loadInFlight = true
 
-        if let currentApp {
-            // Already have a running session — load new media directly
-            client.load(media: media, with: currentApp) { [weak self] result in
+        let load: @MainActor (CastApp) -> Void = { [weak self, weak client] app in
+            client?.load(media: media, with: app) { [weak self] result in
                 Task { @MainActor [weak self] in
-                    if case .failure(let error) = result {
+                    guard let self, self.loadGeneration == generation else { return }
+                    self.loadInFlight = false
+                    switch result {
+                    case .success(let status):
+                        self.apply(status)
+                    case .failure(let error):
                         print("[CastManager] Load failed: \(error)")
-                        self?.isCastPlaying = false
+                        self.fail(with: error)
                     }
                 }
             }
+        }
+
+        if let currentApp {
+            // Already have a running session — load new media directly
+            load(currentApp)
         } else {
-            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self, weak client] result in
-                switch result {
-                case .success(let app):
-                    // Completion runs on main queue — safe to update and load sequentially
-                    Task { @MainActor [weak self, weak client] in
-                        guard let self, let client else { return }
+            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self] result in
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadGeneration == generation else { return }
+                    switch result {
+                    case .success(let app):
                         self.currentApp = app
-                        client.load(media: media, with: app) { [weak self] result in
-                            Task { @MainActor [weak self] in
-                                if case .failure(let error) = result {
-                                    print("[CastManager] Load after launch failed: \(error)")
-                                    self?.isCastPlaying = false
-                                }
-                            }
-                        }
-                    }
-                case .failure:
-                    Task { @MainActor [weak self] in
-                        self?.isCastPlaying = false
+                        load(app)
+                    case .failure(let error):
+                        print("[CastManager] Launch failed: \(error)")
+                        self.loadInFlight = false
+                        self.fail(with: error)
                     }
                 }
             }
@@ -215,31 +264,108 @@ public class CastManager: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if case .success(let status) = result {
-                    self.castPosition = status.adjustedCurrentTime
-                    self.onCastPositionUpdated?(status.adjustedCurrentTime)
+                    self.apply(status)
                 }
             }
         }
     }
 
     public func disconnect() {
-        let lastPosition = castPosition
-        client?.stopCurrentApp()
-        client?.disconnect()
-        client = nil
-        currentApp = nil
-        clientDelegate = nil
-        isConnected = false
-        connectedDeviceName = nil
-        isCastPlaying = false
-        player?.unmuteFromCast()
-        onCastEnded?(lastPosition)
+        endSession(stopApp: true)
     }
 
     deinit {
         client?.delegate = nil
         client?.stopCurrentApp()
         client?.disconnect()
+    }
+
+    // MARK: - Session state
+
+    /// Takes in a report from the receiver.
+    private func apply(_ status: CastMediaStatus) {
+        if status.playerState == .idle {
+            // Idle reports that arrive while a new load is outstanding
+            // belong to the media being replaced.
+            guard !loadInFlight else { return }
+            lastMediaStatus = status
+            isCastPlaying = false
+            let wasIdle = playerState == .idle
+            playerState = .idle
+            if !wasIdle {
+                onCastStateChanged?(.idle)
+                onCastIdle?(status.idleReason)
+            }
+            return
+        }
+
+        lastMediaStatus = status
+        castPosition = status.estimatedCurrentTime
+        isCastPlaying = status.playerState == .playing || status.playerState == .buffering
+        if playerState != status.playerState {
+            playerState = status.playerState
+            onCastStateChanged?(status.playerState)
+        }
+        onCastPositionUpdated?(castPosition)
+    }
+
+    /// The receiver reported that its media session is over.
+    private func mediaSessionEnded() {
+        guard !loadInFlight else { return }
+        isCastPlaying = false
+        let wasIdle = playerState == .idle
+        playerState = .idle
+        if !wasIdle {
+            onCastStateChanged?(.idle)
+            onCastIdle?(nil)
+        }
+    }
+
+    /// Ends the session over a failure and tells the app.
+    private func fail(with error: CastError) {
+        endSession(stopApp: false)
+        onCastError?(error)
+    }
+
+    /// Ends the session: tells the app where the receiver was, then gives
+    /// it its player back. The order matters — the app moves the player
+    /// while it is still silent. With no session to end, nothing is said.
+    private func endSession(stopApp: Bool) {
+        let hadSession = client != nil || isConnected || isConnecting
+        let lastPosition = estimatedPosition
+
+        if stopApp { client?.stopCurrentApp() }
+        client?.delegate = nil
+        client?.disconnect()
+        client = nil
+        currentApp = nil
+        clientDelegate = nil
+        isConnected = false
+        isConnecting = false
+        connectedDeviceName = nil
+        connectedDeviceId = nil
+        isCastPlaying = false
+        playerState = .idle
+        lastMediaStatus = nil
+        castPosition = 0
+        loadInFlight = false
+        loadGeneration += 1
+
+        guard hadSession else { return }
+        onCastEnded?(lastPosition)
+        unmuteLocalPlayer()
+    }
+
+    private func muteLocalPlayer() {
+        guard !playerMuted else { return }
+        playerMuted = true
+        player?.muteForCast()
+    }
+
+    private func unmuteLocalPlayer() {
+        guard playerMuted else { return }
+        playerMuted = false
+        player?.unmuteFromCast()
     }
 
     // MARK: - Scanner Delegate
@@ -255,6 +381,7 @@ public class CastManager: ObservableObject {
             MainActor.assumeIsolated {
                 guard let manager else { return }
                 manager.availableDevices = manager.scanner.devices
+                manager.scanError = nil
             }
         }
 
@@ -271,6 +398,13 @@ public class CastManager: ObservableObject {
                 manager.availableDevices = manager.scanner.devices
             }
         }
+
+        func scannerDidFail(_ message: String) {
+            MainActor.assumeIsolated {
+                guard let manager else { return }
+                manager.scanError = message
+            }
+        }
     }
 
     // MARK: - Client Delegate
@@ -284,69 +418,72 @@ public class CastManager: ObservableObject {
 
         func castClient(_ client: CastClient, didConnectTo device: CastDevice) {
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager else { return }
-                // Start cast from the player's current position
-                manager.startPosition = manager.player?.currentPlaybackTime ?? 0
-                manager.player?.muteForCast()
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.isConnecting = false
                 manager.isConnected = true
                 manager.connectedDeviceName = device.name
-                manager.isCastPlaying = true
-                manager.castStream()
+                manager.connectedDeviceId = device.id
+                // Cast what is playing, from where it is. With nothing
+                // loaded, the connection just waits for the next track.
+                if let player = manager.player, player.hasMedia, !manager.streamURL.isEmpty {
+                    manager.startPosition = player.currentPlaybackTime
+                    manager.castStream(autoplay: player.isPlaying)
+                }
             }
         }
 
         func castClient(_ client: CastClient, didDisconnectFrom device: CastDevice) {
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager, manager.isConnected else { return }
-                let lastPosition = manager.castPosition
-                manager.isConnected = false
-                manager.connectedDeviceName = nil
-                manager.isCastPlaying = false
-                manager.player?.unmuteFromCast()
-                manager.onCastEnded?(lastPosition)
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.endSession(stopApp: false)
+                manager.onCastError?(.disconnected)
             }
         }
 
         func castClient(_ client: CastClient, connectionTo device: CastDevice, didFailWith error: Error?) {
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager else { return }
-                manager.isConnected = false
-                manager.connectedDeviceName = nil
-                manager.isCastPlaying = false
-                manager.player?.unmuteFromCast()
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.endSession(stopApp: false)
+                let castError = (error as? CastError) ?? .connection(error?.localizedDescription ?? "Could not connect")
+                manager.onCastError?(castError)
             }
         }
 
         func castClient(_ client: CastClient, deviceStatusDidChange status: CastStatus) {
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager else { return }
+                guard let manager = self?.manager, manager.client === client else { return }
                 manager.castVolume = Float(status.volume)
             }
         }
 
         func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus) {
-            // Snapshot generation before hopping to MainActor — if a new LOAD
-            // is issued before the Task runs, the IDLE status is stale.
-            let gen = manager?.loadGeneration ?? -1
             Task { @MainActor [weak self] in
-                guard let manager = self?.manager else { return }
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.apply(status)
+            }
+        }
 
-                // When the cast device goes IDLE (track finished or error), don't
-                // propagate the stale position — it belongs to the old track and
-                // would seek the local player to the wrong place in the new track.
-                if status.playerState == .idle {
-                    if let reason = status.idleReason {
-                        print("[CastManager] Cast went idle: \(reason) (gen=\(gen)/\(manager.loadGeneration))")
-                    }
-                    // Only mark as not playing if no new load was issued since the IDLE arrived
-                    if manager.loadGeneration == gen {
-                        manager.isCastPlaying = false
-                    }
-                    return
-                }
+        func castClient(_ client: CastClient, mediaSessionDidEnd mediaSessionId: Int) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.mediaSessionEnded()
+            }
+        }
 
-                manager.castPosition = status.adjustedCurrentTime
-                manager.onCastPositionUpdated?(status.adjustedCurrentTime)
+        func castClient(_ client: CastClient, appSessionDidEnd app: CastApp) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager, manager.client === client else { return }
+                // The receiver app is gone — quit, idled out, or taken
+                // over by another sender. The speaker has stopped, so the
+                // app gets its player back.
+                manager.fail(with: .session("The receiver stopped playing"))
+            }
+        }
+
+        func castClient(_ client: CastClient, mediaDidFail error: CastError) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.fail(with: error)
             }
         }
     }
