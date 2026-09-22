@@ -298,6 +298,7 @@ public class CastManager: ObservableObject {
             let wasIdle = playerState == .idle
             playerState = .idle
             if !wasIdle {
+                print("[CastManager] receiver idle: \(status.idleReasonRaw ?? "-")")
                 onCastStateChanged?(.idle)
                 onCastIdle?(status.idleReason)
             }
@@ -308,6 +309,7 @@ public class CastManager: ObservableObject {
         castPosition = status.estimatedCurrentTime
         isCastPlaying = status.playerState == .playing || status.playerState == .buffering
         if playerState != status.playerState {
+            print("[CastManager] receiver \(status.playerState.rawValue) at \(String(format: "%.1f", status.currentTime))s")
             playerState = status.playerState
             onCastStateChanged?(status.playerState)
         }

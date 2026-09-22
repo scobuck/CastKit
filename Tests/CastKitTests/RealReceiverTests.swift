@@ -69,6 +69,31 @@ final class RealReceiverTests: XCTestCase {
     func deviceDidGoOffline(_ device: CastDevice) {}
   }
 
+  /// Sets a device's volume and leaves: `CASTKIT_REAL_DEVICE=… CASTKIT_SET_VOLUME=0.1`.
+  func testSetVolumeOnly() throws {
+    guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty,
+          let level = ProcessInfo.processInfo.environment["CASTKIT_SET_VOLUME"].flatMap(Float.init) else {
+      throw XCTSkip("set CASTKIT_REAL_DEVICE and CASTKIT_SET_VOLUME")
+    }
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    scanner.stopScanning()
+    let device = try XCTUnwrap(finder.device, "no device matching \"\(wanted)\" — seen: \(finder.seen)")
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    XCTAssertTrue(client.isConnected)
+    client.setVolume(level)
+    Thread.sleep(forTimeInterval: 1)
+    print("[real] \(device.name) volume set to \(level) (was \(events.receiverStatuses.first.map { "\($0.volume)" } ?? "?"))")
+    client.disconnect()
+  }
+
   func testPlaysOnARealReceiver() throws {
     guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
       throw XCTSkip("set CASTKIT_REAL_DEVICE to (part of) a device name to run against real hardware")

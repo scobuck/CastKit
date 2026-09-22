@@ -68,6 +68,8 @@ public struct CastButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(castManager.isConnected ? "Cast, connected to \(castManager.connectedDeviceName ?? "a device")" : "Cast")
+        .accessibilityIdentifier("castButton")
         .sheet(isPresented: $showDevicePicker) {
             CastDevicePickerSheet()
                 .environmentObject(castManager)
