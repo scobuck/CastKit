@@ -33,6 +33,10 @@ class MediaControlChannel: CastChannel {
         delegate?.channelDidReportNoMediaSession(self)
       }
 
+    case .queueChange:
+      delegate?.channel(self, queueChanged: json[CastJSONPayloadKeys.itemIds].array?.compactMap(\.int) ?? [],
+                        changeType: json[CastJSONPayloadKeys.changeType].string ?? "")
+
     case _ where type.isError:
       // A rejection carrying a request id reaches that request's handler
       // (see `mediaStatus(from:)`); one without is the receiver reporting
@@ -125,6 +129,76 @@ class MediaControlChannel: CastChannel {
     send(request, completion: completion)
   }
 
+  // MARK: Queue
+
+  public func queueLoad(items: [CastQueueItem], startIndex: Int, startTime: Double, repeatMode: String, with app: CastApp, completion: @escaping StatusCompletion) {
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueLoad.rawValue,
+      CastJSONPayloadKeys.sessionId: app.sessionId,
+      CastJSONPayloadKeys.items: items.map(\.dict),
+      CastJSONPayloadKeys.startIndex: startIndex,
+      CastJSONPayloadKeys.currentTime: startTime,
+      CastJSONPayloadKeys.repeatMode: repeatMode
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
+  public func queueInsert(items: [CastQueueItem], insertBefore: Int?, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    var payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueInsert.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.items: items.map(\.dict)
+    ]
+    if let insertBefore { payload[CastJSONPayloadKeys.insertBefore] = insertBefore }
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
+  public func queueRemove(itemIds: [Int], for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueRemove.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.itemIds: itemIds
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
+  /// Jumps `jump` items (±1 for next/previous) or to `currentItemId`.
+  public func queueUpdate(jump: Int?, currentItemId: Int?, repeatMode: String?, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    var payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueUpdate.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId
+    ]
+    if let jump { payload[CastJSONPayloadKeys.jump] = jump }
+    if let currentItemId { payload[CastJSONPayloadKeys.currentItemId] = currentItemId }
+    if let repeatMode { payload[CastJSONPayloadKeys.repeatMode] = repeatMode }
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
+  public func queueItemIds(for app: CastApp, mediaSessionId: Int, completion: @escaping @Sendable (Result<[Int], CastError>) -> Void) {
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueGetItemIds.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request) { result in
+      switch result {
+      case .success(let json):
+        let rawType = json[CastJSONPayloadKeys.type].string ?? ""
+        if CastMessageType(rawValue: rawType) == .queueItemIds {
+          completion(.success(json[CastJSONPayloadKeys.itemIds].array?.compactMap(\.int) ?? []))
+        } else {
+          completion(.failure(.rejected(type: rawType, reason: json[CastJSONPayloadKeys.reason].string)))
+        }
+      case .failure(let error):
+        completion(.failure(error))
+      }
+    }
+  }
+
   public func load(media: CastMedia, with app: CastApp, completion: @escaping StatusCompletion) {
     var payload = media.dict
     payload[CastJSONPayloadKeys.type] = CastMessageType.load.rawValue
@@ -141,4 +215,5 @@ protocol MediaControlChannelDelegate: AnyObject {
   func channel(_ channel: MediaControlChannel, didReceive mediaStatus: CastMediaStatus)
   func channelDidReportNoMediaSession(_ channel: MediaControlChannel)
   func channel(_ channel: MediaControlChannel, didReceiveError error: CastError)
+  func channel(_ channel: MediaControlChannel, queueChanged itemIds: [Int], changeType: String)
 }

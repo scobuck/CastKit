@@ -94,6 +94,68 @@ final class RealReceiverTests: XCTestCase {
     client.disconnect()
   }
 
+  /// Queues two clips and waits for the receiver to move to the second on
+  /// its own: `CASTKIT_REAL_DEVICE=… CASTKIT_REAL_CLIP=<10 s clip URL>`.
+  func testQueueAdvancesOnARealReceiver() throws {
+    guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty,
+          let clip = ProcessInfo.processInfo.environment["CASTKIT_REAL_CLIP"].flatMap(URL.init(string:)) else {
+      throw XCTSkip("set CASTKIT_REAL_DEVICE and CASTKIT_REAL_CLIP (a short clip)")
+    }
+    let contentType = ProcessInfo.processInfo.environment["CASTKIT_REAL_CONTENT_TYPE"] ?? "audio/wav"
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    scanner.stopScanning()
+    let device = try XCTUnwrap(finder.device)
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    defer { client.disconnect() }
+    let restoreVolume = ProcessInfo.processInfo.environment["CASTKIT_RESTORE_VOLUME"].flatMap(Float.init) ?? 0.36
+    client.setVolume(0.1)
+    defer { client.setVolume(restoreVolume); Thread.sleep(forTimeInterval: 0.5) }
+
+    let launched = expectation(description: "launched")
+    let appBox = ResultBox<CastApp>()
+    client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { result in
+      appBox.value = result
+      launched.fulfill()
+    }
+    wait(for: [launched], timeout: 15)
+    let app = try XCTUnwrap(appBox.value).get()
+
+    let items = ["first", "second"].map { key in
+      CastQueueItem(media: CastMedia(title: "Queue \(key)", artist: "Highnote", url: clip, contentType: contentType),
+                    preloadTime: 5, customData: ["key": key])
+    }
+    let loaded = expectation(description: "queue loaded")
+    let box = ResultBox<CastMediaStatus>()
+    client.queueLoad(items: items, with: app) { result in
+      box.value = result
+      loaded.fulfill()
+    }
+    wait(for: [loaded], timeout: 20)
+    let status = try XCTUnwrap(box.value).get()
+    print("[real] queue load reply: \(status) items=\(status.items?.map { "\($0.itemId):\($0.customData)" } ?? [])")
+    let firstId = try XCTUnwrap(status.items?.first?.itemId)
+    let secondId = try XCTUnwrap(status.items?.last?.itemId)
+
+    let onSecond = events.expectStatus("second item playing") { $0.currentItemId == secondId && $0.playerState == .playing }
+    XCTWaiter().wait(for: [onSecond], timeout: 60)
+    let last = try XCTUnwrap(events.statuses.last)
+    print("[real] final status: \(last) currentItemId=\(last.currentItemId ?? -1) (first \(firstId), second \(secondId))")
+    XCTAssertEqual(last.currentItemId, secondId, "the receiver did not move on to the second item by itself")
+    let stopped = expectation(description: "stopped")
+    client.stop { _ in stopped.fulfill() }
+    wait(for: [stopped], timeout: 10)
+    client.stopCurrentApp()
+    Thread.sleep(forTimeInterval: 1)
+  }
+
   func testPlaysOnARealReceiver() throws {
     guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
       throw XCTSkip("set CASTKIT_REAL_DEVICE to (part of) a device name to run against real hardware")

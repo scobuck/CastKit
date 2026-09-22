@@ -41,6 +41,10 @@ final class FakeReceiver: @unchecked Sendable {
   var overrides: [String: Script] = [:]
   /// When false, the receiver accepts the socket and says nothing at all.
   var speaks = true
+  /// The receiver's queue: (itemId, customData) in order, and the current one.
+  private(set) var queueItems: [(id: Int, custom: [String: String])] = []
+  private(set) var queueCurrentId: Int?
+  private var nextItemId = 1
 
   var received: [Received] {
     lock.withLock { receivedMessages }
@@ -178,7 +182,7 @@ final class FakeReceiver: @unchecked Sendable {
     return payload
   }
 
-  func mediaStatus(state: String = "PLAYING", currentTime: Double = 1.5, idleReason: String? = nil, sessionId: Int = 7, requestId: Int? = nil) -> [String: Any] {
+  func mediaStatus(state: String = "PLAYING", currentTime: Double = 1.5, idleReason: String? = nil, sessionId: Int = 7, requestId: Int? = nil, withQueue: Bool = false) -> [String: Any] {
     var entry: [String: Any] = [
       "mediaSessionId": sessionId,
       "playbackRate": 1,
@@ -189,6 +193,12 @@ final class FakeReceiver: @unchecked Sendable {
       "media": ["contentId": "http://example.test/a.mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED", "duration": 240.5],
     ]
     if let idleReason { entry["idleReason"] = idleReason }
+    if let current = queueCurrentId {
+      entry["currentItemId"] = current
+      if withQueue {
+        entry["items"] = queueItems.map { ["itemId": $0.id, "customData": $0.custom, "media": ["contentId": "http://example.test/\($0.id).mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED"]] as [String: Any] }
+      }
+    }
     var payload: [String: Any] = ["type": "MEDIA_STATUS", "status": [entry]]
     if let requestId { payload["requestId"] = requestId }
     return payload
@@ -207,7 +217,42 @@ final class FakeReceiver: @unchecked Sendable {
       appRunning = false
       return [(CastNamespace.receiver, receiverStatus())]
     case (CastNamespace.media, "LOAD"):
+      queueItems = []; queueCurrentId = nil
       return [(CastNamespace.media, mediaStatus(state: "BUFFERING", currentTime: 0))]
+    case (CastNamespace.media, "QUEUE_LOAD"):
+      let items = (message.json["items"] as? [[String: Any]]) ?? []
+      queueItems = items.map { item in
+        defer { nextItemId += 1 }
+        return (nextItemId, (item["customData"] as? [String: String]) ?? [:])
+      }
+      let start = (message.json["startIndex"] as? Int) ?? 0
+      queueCurrentId = queueItems.indices.contains(start) ? queueItems[start].id : queueItems.first?.id
+      return [(CastNamespace.media, mediaStatus(state: "BUFFERING", currentTime: 0, withQueue: true))]
+    case (CastNamespace.media, "QUEUE_INSERT"):
+      let items = (message.json["items"] as? [[String: Any]]) ?? []
+      let added = items.map { item -> (id: Int, custom: [String: String]) in
+        defer { nextItemId += 1 }
+        return (nextItemId, (item["customData"] as? [String: String]) ?? [:])
+      }
+      if let before = message.json["insertBefore"] as? Int, let index = queueItems.firstIndex(where: { $0.id == before }) {
+        queueItems.insert(contentsOf: added, at: index)
+      } else {
+        queueItems.append(contentsOf: added)
+      }
+      return [(CastNamespace.media, mediaStatus(withQueue: true))]
+    case (CastNamespace.media, "QUEUE_REMOVE"):
+      let ids = Set((message.json["itemIds"] as? [Int]) ?? [])
+      queueItems.removeAll { ids.contains($0.id) }
+      return [(CastNamespace.media, mediaStatus(withQueue: true))]
+    case (CastNamespace.media, "QUEUE_UPDATE"):
+      if let jump = message.json["jump"] as? Int, let current = queueCurrentId,
+         let index = queueItems.firstIndex(where: { $0.id == current }) {
+        let target = index + jump
+        if queueItems.indices.contains(target) { queueCurrentId = queueItems[target].id }
+      }
+      return [(CastNamespace.media, mediaStatus(withQueue: true))]
+    case (CastNamespace.media, "QUEUE_GET_ITEM_IDS"):
+      return [(CastNamespace.media, ["type": "QUEUE_ITEM_IDS", "itemIds": queueItems.map(\.id)])]
     case (CastNamespace.media, "GET_STATUS"), (CastNamespace.media, "PAUSE"), (CastNamespace.media, "PLAY"), (CastNamespace.media, "SEEK"):
       return [(CastNamespace.media, mediaStatus(state: message.type == "PAUSE" ? "PAUSED" : "PLAYING"))]
     default:

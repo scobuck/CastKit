@@ -43,6 +43,15 @@ enum CastMessageType: String {
   // of these instead of the status it was asked for; they used to fall
   // through as "unknown type" and the caller waited for a reply that had
   // already come.
+  case queueLoad = "QUEUE_LOAD"
+  case queueInsert = "QUEUE_INSERT"
+  case queueUpdate = "QUEUE_UPDATE"
+  case queueRemove = "QUEUE_REMOVE"
+  case queueGetItemIds = "QUEUE_GET_ITEM_IDS"
+  case queueItemIds = "QUEUE_ITEM_IDS"
+  case queueGetItems = "QUEUE_GET_ITEMS"
+  case queueItems = "QUEUE_ITEMS"
+  case queueChange = "QUEUE_CHANGE"
   case loadFailed = "LOAD_FAILED"
   case loadCancelled = "LOAD_CANCELLED"
   case launchError = "LAUNCH_ERROR"
@@ -104,6 +113,18 @@ struct CastJSONPayloadKeys {
   static let duration = "duration"
   static let supportedMediaCommands = "supportedMediaCommands"
   static let customData = "customData"
+  static let items = "items"
+  static let itemId = "itemId"
+  static let itemIds = "itemIds"
+  static let currentItemId = "currentItemId"
+  static let loadingItemId = "loadingItemId"
+  static let preloadedItemId = "preloadedItemId"
+  static let startIndex = "startIndex"
+  static let startTime = "startTime"
+  static let preloadTime = "preloadTime"
+  static let insertBefore = "insertBefore"
+  static let jump = "jump"
+  static let changeType = "changeType"
 }
 
 struct CastConstants {

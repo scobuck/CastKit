@@ -41,6 +41,14 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
   /// The media-level (not device) volume, when reported.
   public let volumeLevel: Double?
   public let volumeMuted: Bool?
+  /// The receiver's queue, when it is playing one: the item that is
+  /// playing, the one it is loading, the one it has preloaded, and — in
+  /// the statuses that carry them — the items themselves.
+  public let currentItemId: Int?
+  public let loadingItemId: Int?
+  public let preloadedItemId: Int?
+  public let items: [CastQueueItemStatus]?
+  public let repeatMode: String?
   /// When this report arrived.
   public let receivedAt = Date()
 
@@ -89,9 +97,31 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
     idleReasonRaw = json[CastJSONPayloadKeys.idleReason].string
     idleReason = idleReasonRaw.flatMap(CastIdleReason.init)
     supportedMediaCommands = json[CastJSONPayloadKeys.supportedMediaCommands].int ?? 0
+    currentItemId = json[CastJSONPayloadKeys.currentItemId].int
+    loadingItemId = json[CastJSONPayloadKeys.loadingItemId].int
+    preloadedItemId = json[CastJSONPayloadKeys.preloadedItemId].int
+    items = json[CastJSONPayloadKeys.items].array.map { $0.map(CastQueueItemStatus.init) }
+    repeatMode = json[CastJSONPayloadKeys.repeatMode].string
     volumeLevel = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.level].double
     volumeMuted = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.muted].bool
 
     super.init()
+  }
+}
+
+/// An item as the receiver reports it in its queue.
+public struct CastQueueItemStatus: Sendable {
+  public let itemId: Int
+  public let contentId: String?
+  public let customData: [String: String]
+
+  init(json: JSON) {
+    itemId = json[CastJSONPayloadKeys.itemId].int ?? 0
+    contentId = json[CastJSONPayloadKeys.media][CastJSONPayloadKeys.contentId].string
+    var custom: [String: String] = [:]
+    for (key, value) in json[CastJSONPayloadKeys.customData].dictionaryValue {
+      if let string = value.string { custom[key] = string }
+    }
+    customData = custom
   }
 }

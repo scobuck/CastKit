@@ -73,6 +73,20 @@ public class CastManager: ObservableObject {
     /// The media length the receiver last reported, when it has reported one.
     public var mediaDuration: TimeInterval? { lastKnownDuration }
     private var lastKnownDuration: TimeInterval?
+    /// The queue item the receiver is playing, when it plays from a queue.
+    @Published public private(set) var currentItemId: Int?
+    /// The custom data of the item the receiver is playing, as the sender
+    /// attached it — how the app tells which of its tracks is playing.
+    @Published public private(set) var currentItemCustomData: [String: String] = [:]
+    /// The receiver moved to another item of its queue.
+    public var onCastItemChanged: ((_ itemId: Int, _ customData: [String: String]) -> Void)?
+    /// The receiver's queue changed; these are the ids it holds now.
+    public var onCastQueueChanged: (([Int]) -> Void)?
+    /// Whether the receiver app is stopped when this app is terminated.
+    /// Off, the receiver plays on through whatever it has queued.
+    public var stopsReceiverOnTerminate = true
+    /// Items the receiver reported, by id — their custom data.
+    private var knownItems: [Int: [String: String]] = [:]
     /// Incremented each time a new media load is initiated, so a reply to
     /// an earlier load is ignored.
     private var loadGeneration: Int = 0
@@ -105,7 +119,7 @@ public class CastManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.client?.stopCurrentApp()
+                if self.stopsReceiverOnTerminate { self.client?.stopCurrentApp() }
                 self.client?.disconnect()
             }
         }
@@ -117,7 +131,7 @@ public class CastManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.client?.stopCurrentApp()
+                if self.stopsReceiverOnTerminate { self.client?.stopCurrentApp() }
                 self.client?.disconnect()
             }
         }
@@ -283,6 +297,82 @@ public class CastManager: ObservableObject {
         client?.seek(to: Float(seconds))
     }
 
+    /// Loads a queue on the receiver, launching the receiver app first when
+    /// it isn't running. The receiver preloads each next item and runs on
+    /// through the queue by itself.
+    public func loadQueue(_ items: [CastQueueItem], startIndex: Int = 0, startTime: TimeInterval = 0) {
+        guard let client = client, client.isConnected else {
+            print("[CastManager] loadQueue: no client or not connected")
+            return
+        }
+        isCastPlaying = items.indices.contains(startIndex) ? items[startIndex].autoplay : true
+        playerState = .buffering
+        lastKnownDuration = nil
+        knownItems = [:]
+        currentItemId = nil
+        currentItemCustomData = [:]
+        loadGeneration += 1
+        let generation = loadGeneration
+        loadInFlight = true
+
+        let load: @MainActor (CastApp) -> Void = { [weak self, weak client] app in
+            client?.queueLoad(items: items, startIndex: startIndex, startTime: startTime, with: app) { [weak self] result in
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadGeneration == generation else { return }
+                    self.loadInFlight = false
+                    switch result {
+                    case .success(let status):
+                        if status.playerState == .idle, status.idleReason == nil { return }
+                        self.apply(status)
+                    case .failure(let error):
+                        print("[CastManager] Queue load failed: \(error)")
+                        self.fail(with: error)
+                    }
+                }
+            }
+        }
+
+        if let currentApp {
+            load(currentApp)
+        } else {
+            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self] result in
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadGeneration == generation else { return }
+                    switch result {
+                    case .success(let app):
+                        self.currentApp = app
+                        load(app)
+                    case .failure(let error):
+                        print("[CastManager] Launch failed: \(error)")
+                        self.loadInFlight = false
+                        self.fail(with: error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adds items after the receiver's current item (or before `before`).
+    public func insertQueueItems(_ items: [CastQueueItem], before itemId: Int? = nil) {
+        client?.queueInsert(items: items, insertBefore: itemId) { [weak self] result in
+            Task { @MainActor [weak self] in
+                if case .success(let status) = result { self?.apply(status) }
+            }
+        }
+    }
+
+    public func removeQueueItems(_ itemIds: [Int]) {
+        guard !itemIds.isEmpty else { return }
+        client?.queueRemove(itemIds: itemIds) { [weak self] result in
+            Task { @MainActor [weak self] in
+                if case .success(let status) = result { self?.apply(status) }
+            }
+        }
+    }
+
+    public func queueNext() { client?.queueJump(1) }
+    public func queuePrevious() { client?.queueJump(-1) }
+
     /// Stops the media on the receiver; the receiver app stays running.
     public func stopMedia() {
         client?.stop()
@@ -336,6 +426,7 @@ public class CastManager: ObservableObject {
 
         lastMediaStatus = status
         if let duration = status.duration, duration > 0 { lastKnownDuration = duration }
+        noteQueue(in: status)
         castPosition = status.estimatedCurrentTime
         isCastPlaying = status.playerState == .playing || status.playerState == .buffering
         if playerState != status.playerState {
@@ -344,6 +435,21 @@ public class CastManager: ObservableObject {
             onCastStateChanged?(status.playerState)
         }
         onCastPositionUpdated?(castPosition)
+    }
+
+    /// Remembers the items a status carries and notices the receiver moving
+    /// to another one. A status doesn't always list the items, so those
+    /// seen earlier are kept by id.
+    private func noteQueue(in status: CastMediaStatus) {
+        if let items = status.items {
+            for item in items { knownItems[item.itemId] = item.customData }
+        }
+        guard let itemId = status.currentItemId, itemId != 0 else { return }
+        if itemId != currentItemId {
+            currentItemId = itemId
+            currentItemCustomData = knownItems[itemId] ?? [:]
+            onCastItemChanged?(itemId, currentItemCustomData)
+        }
     }
 
     /// The receiver reported that its media session is over.
@@ -389,6 +495,9 @@ public class CastManager: ObservableObject {
         castPosition = 0
         loadInFlight = false
         loadGeneration += 1
+        knownItems = [:]
+        currentItemId = nil
+        currentItemCustomData = [:]
 
         guard hadSession else { return }
         onCastEnded?(lastPosition)
@@ -524,6 +633,13 @@ public class CastManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager, manager.client === client else { return }
                 manager.fail(with: error)
+            }
+        }
+
+        func castClient(_ client: CastClient, queueChanged itemIds: [Int], changeType: String) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.onCastQueueChanged?(itemIds)
             }
         }
     }

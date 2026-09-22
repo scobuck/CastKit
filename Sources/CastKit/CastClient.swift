@@ -91,6 +91,8 @@ public protocol CastClientDelegate: AnyObject {
   func castClient(_ client: CastClient, appSessionDidEnd app: CastApp)
   /// The receiver reported a media failure on its own, outside any request.
   func castClient(_ client: CastClient, mediaDidFail error: CastError)
+  /// The receiver's queue changed: these are the item ids it now holds.
+  func castClient(_ client: CastClient, queueChanged itemIds: [Int], changeType: String)
 
 }
 
@@ -105,6 +107,7 @@ public extension CastClientDelegate {
   func castClient(_ client: CastClient, mediaSessionDidEnd mediaSessionId: Int) {}
   func castClient(_ client: CastClient, appSessionDidEnd app: CastApp) {}
   func castClient(_ client: CastClient, mediaDidFail error: CastError) {}
+  func castClient(_ client: CastClient, queueChanged itemIds: [Int], changeType: String) {}
 }
 
 public final class CastClient: NSObject, RequestDispatchable, Channelable, @unchecked Sendable {
@@ -635,6 +638,53 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     mediaControlChannel.load(media: media, with: app, completion: completion)
   }
 
+  // MARK: Queue
+
+  public func queueLoad(items: [CastQueueItem], startIndex: Int = 0, startTime: Double = 0, repeatMode: String = "REPEAT_OFF", with app: CastApp, completion: @escaping @Sendable (Result<CastMediaStatus, CastError>) -> Void) {
+    guard outputStream != nil else {
+      completion(.failure(.notConnected))
+      return
+    }
+    mediaControlChannel.queueLoad(items: items, startIndex: startIndex, startTime: startTime, repeatMode: repeatMode, with: app, completion: completion)
+  }
+
+  public func queueInsert(items: [CastQueueItem], insertBefore: Int? = nil, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.queueInsert(items: items, insertBefore: insertBefore, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
+  public func queueRemove(itemIds: [Int], completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.queueRemove(itemIds: itemIds, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
+  public func queueJump(_ jump: Int, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.queueUpdate(jump: jump, currentItemId: nil, repeatMode: nil, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
+  public func queueItemIds(completion: @escaping @Sendable (Result<[Int], CastError>) -> Void) {
+    guard outputStream != nil, let app = connectedApp else {
+      completion(.failure(.notConnected))
+      return
+    }
+    if let mediaStatus = currentMediaStatus, mediaStatus.hasMediaSession {
+      mediaControlChannel.queueItemIds(for: app, mediaSessionId: mediaStatus.mediaSessionId, completion: completion)
+    } else {
+      mediaControlChannel.requestMediaStatus(for: app) { [weak self] result in
+        switch result {
+        case .success(let status):
+          self?.mediaControlChannel.queueItemIds(for: app, mediaSessionId: status.mediaSessionId, completion: completion)
+        case .failure(let error):
+          completion(.failure(error))
+        }
+      }
+    }
+  }
+
   public func requestMediaStatus(for app: CastApp, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
     guard outputStream != nil else {
       completion?(.failure(.notConnected))
@@ -791,6 +841,13 @@ extension CastClient: MediaControlChannelDelegate {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       self.delegate?.castClient(self, mediaDidFail: error)
+    }
+  }
+
+  func channel(_ channel: MediaControlChannel, queueChanged itemIds: [Int], changeType: String) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.delegate?.castClient(self, queueChanged: itemIds, changeType: changeType)
     }
   }
 }
