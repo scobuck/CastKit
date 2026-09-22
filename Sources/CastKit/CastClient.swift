@@ -666,6 +666,25 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
   }
 
+  public func queueItems(itemIds: [Int], completion: @escaping @Sendable (Result<[CastQueueItemStatus], CastError>) -> Void) {
+    guard outputStream != nil, let app = connectedApp else {
+      completion(.failure(.notConnected))
+      return
+    }
+    if let mediaStatus = currentMediaStatus, mediaStatus.hasMediaSession {
+      mediaControlChannel.queueItems(itemIds: itemIds, for: app, mediaSessionId: mediaStatus.mediaSessionId, completion: completion)
+    } else {
+      mediaControlChannel.requestMediaStatus(for: app) { [weak self] result in
+        switch result {
+        case .success(let status):
+          self?.mediaControlChannel.queueItems(itemIds: itemIds, for: app, mediaSessionId: status.mediaSessionId, completion: completion)
+        case .failure(let error):
+          completion(.failure(error))
+        }
+      }
+    }
+  }
+
   public func queueItemIds(completion: @escaping @Sendable (Result<[Int], CastError>) -> Void) {
     guard outputStream != nil, let app = connectedApp else {
       completion(.failure(.notConnected))

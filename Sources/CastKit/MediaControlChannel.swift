@@ -178,6 +178,29 @@ class MediaControlChannel: CastChannel {
     send(request, completion: completion)
   }
 
+  /// The receiver's items in full — custom data included — for the ids given.
+  public func queueItems(itemIds: [Int], for app: CastApp, mediaSessionId: Int, completion: @escaping @Sendable (Result<[CastQueueItemStatus], CastError>) -> Void) {
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.queueGetItems.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.itemIds: itemIds
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request) { result in
+      switch result {
+      case .success(let json):
+        let rawType = json[CastJSONPayloadKeys.type].string ?? ""
+        if CastMessageType(rawValue: rawType) == .queueItems {
+          completion(.success(json[CastJSONPayloadKeys.items].array?.map(CastQueueItemStatus.init) ?? []))
+        } else {
+          completion(.failure(.rejected(type: rawType, reason: json[CastJSONPayloadKeys.reason].string)))
+        }
+      case .failure(let error):
+        completion(.failure(error))
+      }
+    }
+  }
+
   public func queueItemIds(for app: CastApp, mediaSessionId: Int, completion: @escaping @Sendable (Result<[Int], CastError>) -> Void) {
     let payload: [String: Any] = [
       CastJSONPayloadKeys.type: CastMessageType.queueGetItemIds.rawValue,

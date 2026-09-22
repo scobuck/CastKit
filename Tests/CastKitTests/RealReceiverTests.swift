@@ -141,8 +141,31 @@ final class RealReceiverTests: XCTestCase {
     wait(for: [loaded], timeout: 20)
     let status = try XCTUnwrap(box.value).get()
     print("[real] queue load reply: \(status) items=\(status.items?.map { "\($0.itemId):\($0.customData)" } ?? [])")
-    let firstId = try XCTUnwrap(status.items?.first?.itemId)
-    let secondId = try XCTUnwrap(status.items?.last?.itemId)
+    // The reply may be an idle status with no items; the queue is asked for.
+    let idsKnown = expectation(description: "item ids")
+    let idsBox = ResultBox<[Int]>()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+      client.queueItemIds { result in
+        idsBox.value = result
+        idsKnown.fulfill()
+      }
+    }
+    wait(for: [idsKnown], timeout: 15)
+    let ids = try XCTUnwrap(idsBox.value).get()
+    print("[real] queue item ids: \(ids)")
+    XCTAssertEqual(ids.count, 2)
+    let firstId = try XCTUnwrap(ids.first)
+    let secondId = try XCTUnwrap(ids.last)
+    let itemsKnown = expectation(description: "items")
+    let itemsBox = ResultBox<[CastQueueItemStatus]>()
+    client.queueItems(itemIds: ids) { result in
+      itemsBox.value = result
+      itemsKnown.fulfill()
+    }
+    wait(for: [itemsKnown], timeout: 10)
+    let items = try XCTUnwrap(itemsBox.value).get()
+    print("[real] queue items: \(items.map { "\($0.itemId):\($0.customData)" })")
+    XCTAssertEqual(items.map { $0.customData["key"] }, ["first", "second"])
 
     let onSecond = events.expectStatus("second item playing") { $0.currentItemId == secondId && $0.playerState == .playing }
     XCTWaiter().wait(for: [onSecond], timeout: 60)

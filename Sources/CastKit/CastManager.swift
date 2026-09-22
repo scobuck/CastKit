@@ -327,6 +327,9 @@ public class CastManager: ObservableObject {
                     self.loadInFlight = false
                     switch result {
                     case .success(let status):
+                        // The reply may carry no items yet (an idle status
+                        // before buffering); ask for them.
+                        self.refreshQueueItems()
                         if status.playerState == .idle, status.idleReason == nil { return }
                         self.apply(status)
                     case .failure(let error):
@@ -361,7 +364,9 @@ public class CastManager: ObservableObject {
     public func insertQueueItems(_ items: [CastQueueItem], before itemId: Int? = nil) {
         client?.queueInsert(items: items, insertBefore: itemId) { [weak self] result in
             Task { @MainActor [weak self] in
-                if case .success(let status) = result { self?.apply(status) }
+                guard let self else { return }
+                if case .success(let status) = result { self.apply(status) }
+                self.refreshQueueItems()
             }
         }
     }
@@ -370,9 +375,43 @@ public class CastManager: ObservableObject {
         guard !itemIds.isEmpty else { return }
         client?.queueRemove(itemIds: itemIds) { [weak self] result in
             Task { @MainActor [weak self] in
-                if case .success(let status) = result { self?.apply(status) }
+                guard let self else { return }
+                if case .success(let status) = result { self.apply(status) }
+                self.refreshQueueItems()
             }
         }
+    }
+
+    /// Asks the receiver for its queue — the ids in order, then the items
+    /// with their custom data — and records them. Statuses don't always
+    /// carry the items, and the reply to a queue load often carries none.
+    public func refreshQueueItems() {
+        guard let client else { return }
+        client.queueItemIds { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self, case .success(let ids) = result else { return }
+                self.queueItemIds = ids
+                let unknown = ids.filter { self.knownItems[$0] == nil }
+                guard !unknown.isEmpty else {
+                    self.reconcileCurrentItem()
+                    return
+                }
+                self.client?.queueItems(itemIds: unknown) { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self, case .success(let items) = result else { return }
+                        for item in items { self.knownItems[item.itemId] = item.customData }
+                        self.reconcileCurrentItem()
+                    }
+                }
+            }
+        }
+    }
+
+    /// The current item's custom data may have arrived after the item did.
+    private func reconcileCurrentItem() {
+        guard let id = currentItemId, currentItemCustomData.isEmpty, let custom = knownItems[id], !custom.isEmpty else { return }
+        currentItemCustomData = custom
+        onCastItemChanged?(id, custom)
     }
 
     public func queueNext() { client?.queueJump(1) }
@@ -648,6 +687,7 @@ public class CastManager: ObservableObject {
                 guard let manager = self?.manager, manager.client === client else { return }
                 manager.queueItemIds = itemIds
                 manager.onCastQueueChanged?(itemIds)
+                if itemIds.contains(where: { manager.knownItems[$0] == nil }) { manager.refreshQueueItems() }
             }
         }
     }
