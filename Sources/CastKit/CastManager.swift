@@ -87,6 +87,10 @@ public class CastManager: ObservableObject {
     public var stopsReceiverOnTerminate = true
     /// Items the receiver reported, by id — their custom data.
     private var knownItems: [Int: [String: String]] = [:]
+    /// The custom data of every queue item the receiver has reported, by id.
+    public var knownItemCustomData: [Int: [String: String]] { knownItems }
+    /// The receiver's queue, in order, as last reported.
+    @Published public private(set) var queueItemIds: [Int] = []
     /// Incremented each time a new media load is initiated, so a reply to
     /// an earlier load is ignored.
     private var loadGeneration: Int = 0
@@ -309,6 +313,7 @@ public class CastManager: ObservableObject {
         playerState = .buffering
         lastKnownDuration = nil
         knownItems = [:]
+        queueItemIds = []
         currentItemId = nil
         currentItemCustomData = [:]
         loadGeneration += 1
@@ -443,6 +448,7 @@ public class CastManager: ObservableObject {
     private func noteQueue(in status: CastMediaStatus) {
         if let items = status.items {
             for item in items { knownItems[item.itemId] = item.customData }
+            queueItemIds = items.map(\.itemId)
         }
         guard let itemId = status.currentItemId, itemId != 0 else { return }
         if itemId != currentItemId {
@@ -496,6 +502,7 @@ public class CastManager: ObservableObject {
         loadInFlight = false
         loadGeneration += 1
         knownItems = [:]
+        queueItemIds = []
         currentItemId = nil
         currentItemCustomData = [:]
 
@@ -639,6 +646,7 @@ public class CastManager: ObservableObject {
         func castClient(_ client: CastClient, queueChanged itemIds: [Int], changeType: String) {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager, manager.client === client else { return }
+                manager.queueItemIds = itemIds
                 manager.onCastQueueChanged?(itemIds)
             }
         }
