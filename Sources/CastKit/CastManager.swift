@@ -207,6 +207,11 @@ public class CastManager: ObservableObject {
                     self.loadInFlight = false
                     switch result {
                     case .success(let status):
+                        // The Default Media Receiver answers LOAD with an idle
+                        // status before it has started buffering; the real
+                        // state follows as a broadcast. An idle reply with a
+                        // reason is a failure, and is treated as one.
+                        if status.playerState == .idle, status.idleReason == nil { return }
                         self.apply(status)
                     case .failure(let error):
                         print("[CastManager] Load failed: \(error)")

@@ -1,0 +1,203 @@
+import XCTest
+@testable import CastKit
+
+/// Drives a real receiver on the local network. Opt-in: set
+/// `CASTKIT_REAL_DEVICE` to part of the device's name, e.g.
+/// `CASTKIT_REAL_DEVICE="Nest Hub" swift test --filter RealReceiverTests`.
+/// The device volume is set to 10% for the run and put back afterwards.
+final class RealReceiverTests: XCTestCase {
+
+  private final class Events: CastClientDelegate, @unchecked Sendable {
+    let connected = XCTestExpectation(description: "connected")
+    let disconnected = XCTestExpectation(description: "disconnected")
+    var statuses: [CastMediaStatus] = []
+    var receiverStatuses: [CastStatus] = []
+    var errors: [String] = []
+    var idle: [CastMediaStatus] = []
+    var waitingFor: ((CastMediaStatus) -> Bool)?
+    var waiter: XCTestExpectation?
+    var log: [String] = []
+
+    func note(_ s: String) {
+      let stamp = ISO8601DateFormatter().string(from: Date())
+      log.append("\(stamp) \(s)")
+      print("[real] \(s)")
+    }
+
+    func castClient(_ client: CastClient, didConnectTo device: CastDevice) { note("connected to \(device.name)"); connected.fulfill() }
+    func castClient(_ client: CastClient, didDisconnectFrom device: CastDevice) { note("disconnected"); disconnected.fulfill() }
+    func castClient(_ client: CastClient, connectionTo device: CastDevice, didFailWith error: Error?) { note("connect failed: \(String(describing: error))"); errors.append("connect: \(String(describing: error))") }
+    var onFirstReceiverStatus: (() -> Void)?
+    func castClient(_ client: CastClient, deviceStatusDidChange status: CastStatus) {
+      let first = receiverStatuses.isEmpty
+      receiverStatuses.append(status)
+      note("receiver status: volume \(status.volume) muted \(status.muted) apps \(status.apps.map(\.displayName))")
+      if first { onFirstReceiverStatus?() }
+    }
+    func castClient(_ client: CastClient, mediaStatusDidChange status: CastMediaStatus) {
+      statuses.append(status)
+      note("media status: \(status)")
+      if status.playerState == .idle { idle.append(status) }
+      if let waitingFor, waitingFor(status) { self.waitingFor = nil; waiter?.fulfill() }
+    }
+    func castClient(_ client: CastClient, mediaSessionDidEnd mediaSessionId: Int) { note("media session \(mediaSessionId) ended") }
+    func castClient(_ client: CastClient, appSessionDidEnd app: CastApp) { note("app session ended: \(app.displayName)") }
+    func castClient(_ client: CastClient, mediaDidFail error: CastError) { note("media failed: \(error)"); errors.append("media: \(error)") }
+
+    func expectStatus(_ description: String, _ predicate: @escaping (CastMediaStatus) -> Bool) -> XCTestExpectation {
+      let e = XCTestExpectation(description: description)
+      waiter = e
+      waitingFor = predicate
+      return e
+    }
+  }
+
+  private final class Finder: CastDeviceScannerDelegate, @unchecked Sendable {
+    let wanted: String
+    let found = XCTestExpectation(description: "device found")
+    var device: CastDevice?
+    var seen: [String] = []
+    init(wanted: String) { self.wanted = wanted }
+    func deviceDidComeOnline(_ device: CastDevice) {
+      seen.append(device.name)
+      if self.device == nil, device.name.localizedCaseInsensitiveContains(wanted) {
+        self.device = device
+        found.fulfill()
+      }
+    }
+    func deviceDidChange(_ device: CastDevice) {}
+    func deviceDidGoOffline(_ device: CastDevice) {}
+  }
+
+  func testPlaysOnARealReceiver() throws {
+    guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
+      throw XCTSkip("set CASTKIT_REAL_DEVICE to (part of) a device name to run against real hardware")
+    }
+    let clipURL = URL(string: ProcessInfo.processInfo.environment["CASTKIT_REAL_CLIP"]
+                      ?? "https://www2.cs.uic.edu/~i101/SoundFiles/BabyElephantWalk60.wav")!
+    let contentType = ProcessInfo.processInfo.environment["CASTKIT_REAL_CONTENT_TYPE"] ?? "audio/wav"
+
+    // Discover.
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    scanner.stopScanning()
+    let device = try XCTUnwrap(finder.device, "no device matching \"\(wanted)\" — seen: \(finder.seen)")
+    print("[real] using \(device.name) (\(device.modelName)) at \(device.hostName):\(device.port) caps=\(device.capabilities.rawValue)")
+
+    // Connect.
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    XCTAssertTrue(client.isConnected, "did not connect: \(events.errors)")
+    defer {
+      client.disconnect()
+    }
+
+    // Quiet. The first receiver status carries the volume to put back; a
+    // heartbeat can declare the connection before that status has arrived.
+    let statusSeen = XCTestExpectation(description: "receiver status")
+    if events.receiverStatuses.isEmpty {
+      events.onFirstReceiverStatus = { statusSeen.fulfill() }
+      XCTWaiter().wait(for: [statusSeen], timeout: 10)
+    }
+    let originalVolume = events.receiverStatuses.first.map { Float($0.volume) }
+    print("[real] original volume: \(originalVolume.map { "\($0)" } ?? "unknown")")
+    client.setVolume(0.1)
+    let restoreVolume = ProcessInfo.processInfo.environment["CASTKIT_RESTORE_VOLUME"].flatMap(Float.init) ?? originalVolume ?? 0.36
+    defer {
+      client.setVolume(restoreVolume)
+      print("[real] volume put back to \(restoreVolume)")
+      Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    // Launch and load.
+    let launched = expectation(description: "launched")
+    let appBox = ResultBox<CastApp>()
+    client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { result in
+      appBox.value = result
+      launched.fulfill()
+    }
+    wait(for: [launched], timeout: 15)
+    let app = try XCTUnwrap(appBox.value).get()
+    print("[real] launched \(app.displayName) session \(app.sessionId) transport \(app.transportId)")
+
+    let media = CastMedia(title: "CastKit test clip", artist: "Highnote", url: clipURL, contentType: contentType, autoplay: true, currentTime: 0)
+    let loaded = expectation(description: "loaded")
+    let statusBox = ResultBox<CastMediaStatus>()
+    let playing = events.expectStatus("playing") { $0.playerState == .playing }
+    client.load(media: media, with: app) { result in
+      statusBox.value = result
+      loaded.fulfill()
+    }
+    wait(for: [loaded], timeout: 20)
+    let loadStatus = try XCTUnwrap(statusBox.value).get()
+    print("[real] load reply: \(loadStatus)")
+    XCTAssertTrue(loadStatus.hasMediaSession)
+
+    // A Nest Hub can take a while to fetch the file before it reports anything.
+    XCTWaiter().wait(for: [playing], timeout: 45)
+    let playingStatus = try XCTUnwrap(events.statuses.last(where: { $0.playerState == .playing }), "never reported PLAYING: \(events.errors)")
+    print("[real] playing at \(playingStatus.currentTime)s of \(playingStatus.duration.map { "\($0)" } ?? "?")s, rate \(playingStatus.playbackRate)")
+    Thread.sleep(forTimeInterval: 2)
+
+    // Pause, resume, seek — each confirmed by the receiver's own report.
+    let paused = expectation(description: "pause reply")
+    client.pause { result in
+      print("[real] pause reply: \(result)")
+      paused.fulfill()
+    }
+    wait(for: [paused], timeout: 10)
+    let pausedReport = events.expectStatus("paused") { $0.playerState == .paused }
+    XCTWaiter().wait(for: [pausedReport], timeout: 10)
+    XCTAssertEqual(events.statuses.last?.playerState, .paused)
+
+    // Paused: the estimate must not move.
+    let frozen = events.statuses.last!.estimatedCurrentTime
+    Thread.sleep(forTimeInterval: 1)
+    XCTAssertEqual(events.statuses.last!.estimatedCurrentTime, frozen, accuracy: 0.001)
+
+    let resumed = expectation(description: "play reply")
+    client.play { _ in resumed.fulfill() }
+    wait(for: [resumed], timeout: 10)
+
+    let sought = expectation(description: "seek reply")
+    let seekBox = ResultBox<CastMediaStatus>()
+    client.seek(to: 30) { result in
+      seekBox.value = result
+      sought.fulfill()
+    }
+    wait(for: [sought], timeout: 10)
+    if case .some(.success(let s)) = seekBox.value {
+      print("[real] after seek: \(s.currentTime)s state \(s.playerState)")
+    }
+    let nearThirty = events.expectStatus("at 30s") { $0.currentTime >= 28 && $0.currentTime <= 36 && $0.playerState == .playing }
+    XCTWaiter().wait(for: [nearThirty], timeout: 10)
+
+    let asked = expectation(description: "status reply")
+    client.requestMediaStatus(for: app) { result in
+      print("[real] GET_STATUS reply: \(result)")
+      asked.fulfill()
+    }
+    wait(for: [asked], timeout: 10)
+
+    // Stop the media: the receiver reports IDLE/CANCELLED, or that the session is gone.
+    let stopped = expectation(description: "stop reply")
+    client.stop { result in
+      print("[real] stop reply: \(result)")
+      stopped.fulfill()
+    }
+    wait(for: [stopped], timeout: 10)
+    Thread.sleep(forTimeInterval: 1)
+
+    client.stopCurrentApp()
+    Thread.sleep(forTimeInterval: 1)
+    XCTAssertNil(client.connectedApp)
+    XCTAssertTrue(events.errors.isEmpty, "errors: \(events.errors)")
+    print("[real] transcript:\n" + events.log.joined(separator: "\n"))
+  }
+}
