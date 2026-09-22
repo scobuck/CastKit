@@ -275,6 +275,25 @@ final class RealReceiverTests: XCTestCase {
     client.play { _ in resumed.fulfill() }
     wait(for: [resumed], timeout: 10)
 
+    // Media-level volume (per-track gain, fades): the receiver applies it
+    // to this media session and reports it back, and the device volume
+    // is untouched.
+    for level: Float in [0.5, 1.0] {
+      let volumeSet = expectation(description: "media volume \(level) reply")
+      let volumeBox = ResultBox<CastMediaStatus>()
+      client.setMediaVolume(level) { result in
+        volumeBox.value = result
+        volumeSet.fulfill()
+      }
+      wait(for: [volumeSet], timeout: 10)
+      let volumeStatus = try XCTUnwrap(volumeBox.value).get()
+      print("[real] media volume \(level) reply: level \(volumeStatus.volumeLevel.map { "\($0)" } ?? "?") state \(volumeStatus.playerState)")
+      XCTAssertEqual(try XCTUnwrap(volumeStatus.volumeLevel, "no media volume in the reply"), Double(level), accuracy: 0.01)
+      XCTAssertEqual(volumeStatus.playerState, .playing, "setting the media volume must not change the state")
+    }
+    let deviceVolume = events.receiverStatuses.last.map { Float($0.volume) }
+    XCTAssertEqual(deviceVolume ?? 0.1, 0.1, accuracy: 0.02, "the device volume is not the media volume")
+
     let sought = expectation(description: "seek reply")
     let seekBox = ResultBox<CastMediaStatus>()
     client.seek(to: 30) { result in
