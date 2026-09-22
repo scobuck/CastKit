@@ -103,6 +103,23 @@ class MediaControlChannel: CastChannel {
     send(.stop, for: app, mediaSessionId: mediaSessionId, completion: completion)
   }
 
+  /// The media's own volume, 0–1, on top of the device volume. This is
+  /// where a sender applies per-track gain or a fade without touching the
+  /// level the listener set on the device.
+  public func sendMediaVolume(_ level: Float, muted: Bool?, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    var volume: [String: Any] = [CastJSONPayloadKeys.level: max(0, min(1, level))]
+    if let muted { volume[CastJSONPayloadKeys.muted] = muted }
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.setVolume.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.volume: volume
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace,
+                                 destinationId: app.transportId,
+                                 payload: payload)
+    send(request, completion: completion)
+  }
+
   public func sendSeek(to currentTime: Float, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
     let payload: [String: Any] = [
       CastJSONPayloadKeys.type: CastMessageType.seek.rawValue,

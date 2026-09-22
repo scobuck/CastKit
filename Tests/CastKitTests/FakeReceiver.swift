@@ -41,6 +41,8 @@ final class FakeReceiver: @unchecked Sendable {
   var overrides: [String: Script] = [:]
   /// When false, the receiver accepts the socket and says nothing at all.
   var speaks = true
+  /// The media-level volume last set on the fake.
+  private(set) var mediaVolume: Double = 1
   /// The receiver's queue: (itemId, customData) in order, and the current one.
   private(set) var queueItems: [(id: Int, custom: [String: String])] = []
   private(set) var queueCurrentId: Int?
@@ -189,7 +191,7 @@ final class FakeReceiver: @unchecked Sendable {
       "playerState": state,
       "currentTime": currentTime,
       "supportedMediaCommands": 15,
-      "volume": ["level": 1, "muted": false],
+      "volume": ["level": mediaVolume, "muted": false],
       "media": ["contentId": "http://example.test/a.mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED", "duration": 240.5],
     ]
     if let idleReason { entry["idleReason"] = idleReason }
@@ -253,6 +255,9 @@ final class FakeReceiver: @unchecked Sendable {
       return [(CastNamespace.media, mediaStatus(withQueue: true))]
     case (CastNamespace.media, "QUEUE_GET_ITEM_IDS"):
       return [(CastNamespace.media, ["type": "QUEUE_ITEM_IDS", "itemIds": queueItems.map(\.id)])]
+    case (CastNamespace.media, "SET_VOLUME"):
+      if let level = (message.json["volume"] as? [String: Any])?["level"] as? Double { mediaVolume = level }
+      return [(CastNamespace.media, mediaStatus())]
     case (CastNamespace.media, "GET_STATUS"), (CastNamespace.media, "PAUSE"), (CastNamespace.media, "PLAY"), (CastNamespace.media, "SEEK"):
       return [(CastNamespace.media, mediaStatus(state: message.type == "PAUSE" ? "PAUSED" : "PLAYING"))]
     default:

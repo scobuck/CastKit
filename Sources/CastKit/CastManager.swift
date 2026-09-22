@@ -184,6 +184,13 @@ public class CastManager: ObservableObject {
         client?.setVolume(volume)
     }
 
+    /// The media's own volume on the receiver, 0–1, on top of the device
+    /// volume — for per-track gain and fades. Needs a media session; sent
+    /// once one exists.
+    public func setMediaVolume(_ level: Float) {
+        client?.setMediaVolume(level)
+    }
+
     /// Loads `streamURL` on the receiver. With nothing to cast — no URL,
     /// or a player with nothing loaded — it does nothing; it used to load
     /// whatever URL was set last. The receiver starts playing or paused to

@@ -774,6 +774,13 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     receiverControlChannel.setVolume(volume)
   }
 
+  /// The media's own volume (0–1), independent of the device volume.
+  public func setMediaVolume(_ level: Float, muted: Bool? = nil, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendMediaVolume(level, muted: muted, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
   public func setMuted(_ muted: Bool) {
     guard outputStream != nil else { return }
 

@@ -111,6 +111,21 @@ final class CastQueueTests: XCTestCase {
     XCTAssertEqual(recorder.itemIds, [1, 2, 3])
   }
 
+  func testMediaVolumeIsSetOnTheSession() throws {
+    _ = try queueLoad(["a"])
+    let set = expectation(description: "media volume set")
+    let box = ResultBox<CastMediaStatus>()
+    client.setMediaVolume(0.25) { result in
+      box.value = result
+      set.fulfill()
+    }
+    wait(for: [set], timeout: 5)
+    let status = try XCTUnwrap(box.value).get()
+    XCTAssertEqual(status.volumeLevel ?? -1, 0.25, accuracy: 0.001)
+    let sent = receiver.received.last(where: { $0.namespace == CastNamespace.media && $0.type == "SET_VOLUME" })
+    XCTAssertNotNil(sent?.json["mediaSessionId"], "media volume goes with the media session, not the receiver")
+  }
+
   private final class QueueRecorder: CastClientDelegate, @unchecked Sendable {
     let expectation: XCTestExpectation
     var itemIds: [Int] = []
