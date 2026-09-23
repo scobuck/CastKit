@@ -2,8 +2,9 @@ import XCTest
 @testable import CastKit
 
 /// Drives a real receiver on the local network. Opt-in: set
-/// `CASTKIT_REAL_DEVICE` to part of the device's name, e.g.
-/// `CASTKIT_REAL_DEVICE="Nest Hub" swift test --filter RealReceiverTests`.
+/// `CASTKIT_REAL_DEVICE` to the device's name (the whole name — never a
+/// part, so a group can't be picked by accident), e.g.
+/// `CASTKIT_REAL_DEVICE="Kitchen Display" swift test --filter RealReceiverTests`.
 /// The device volume is set to 10% for the run and put back afterwards.
 final class RealReceiverTests: XCTestCase {
 
@@ -59,8 +60,10 @@ final class RealReceiverTests: XCTestCase {
     var seen: [String] = []
     init(wanted: String) { self.wanted = wanted }
     func deviceDidComeOnline(_ device: CastDevice) {
-      seen.append(device.name)
-      if self.device == nil, device.name.localizedCaseInsensitiveContains(wanted) {
+      seen.append("\(device.name) (\(device.modelName))")
+      // The whole name, not a part of it: "Kitchen Display" must never
+      // pick a group that happens to have the display in its name.
+      if self.device == nil, device.name.compare(wanted, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
         self.device = device
         found.fulfill()
       }
@@ -91,6 +94,46 @@ final class RealReceiverTests: XCTestCase {
     client.setVolume(level)
     Thread.sleep(forTimeInterval: 1)
     print("[real] \(device.name) volume set to \(level) (was \(events.receiverStatuses.first.map { "\($0.volume)" } ?? "?"))")
+    client.disconnect()
+  }
+
+  /// Read-only: lists every receiver on the network for five seconds, then
+  /// connects to `CASTKIT_REAL_DEVICE` (if it is among them) and prints its
+  /// status — the apps it is running and its volume — changing nothing.
+  /// `CASTKIT_STATUS_ONLY=1 CASTKIT_REAL_DEVICE=… swift test --filter testStatusOnly`
+  func testStatusOnly() throws {
+    guard ProcessInfo.processInfo.environment["CASTKIT_STATUS_ONLY"] == "1" else {
+      throw XCTSkip("set CASTKIT_STATUS_ONLY=1 (and CASTKIT_REAL_DEVICE to read one device's status)")
+    }
+    let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"] ?? ""
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    _ = XCTWaiter().wait(for: [XCTestExpectation(description: "five seconds of scanning")], timeout: 5)
+    scanner.stopScanning()
+    print("[real] receivers seen: \(finder.seen.sorted().joined(separator: "; "))")
+    guard let device = finder.device else {
+      print("[real] no receiver named \"\(wanted)\"; nothing read")
+      return
+    }
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    XCTAssertTrue(client.isConnected)
+    let statusSeen = XCTestExpectation(description: "receiver status")
+    if events.receiverStatuses.isEmpty {
+      events.onFirstReceiverStatus = { statusSeen.fulfill() }
+      XCTWaiter().wait(for: [statusSeen], timeout: 10)
+    }
+    if let status = events.receiverStatuses.first {
+      let apps = status.apps.map { "\($0.displayName) [\($0.id)]\($0.isIdleScreen ? " (idle screen)" : "")" }
+      print("[real] \(device.name): volume \(status.volume) muted \(status.muted) apps \(apps.isEmpty ? "none" : apps.joined(separator: ", "))")
+    } else {
+      print("[real] \(device.name): no status received")
+    }
     client.disconnect()
   }
 
