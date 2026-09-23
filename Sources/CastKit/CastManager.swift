@@ -26,6 +26,9 @@ public class CastManager: ObservableObject {
 
     private let scanner = CastDeviceScanner()
     private var client: CastClient?
+    /// Whether clients speak TLS to the receiver; tests turn it off to
+    /// drive a plain-TCP fake.
+    var usesTLS = true
     private var currentApp: CastApp?
     private var scannerDelegate: ScannerDelegate?
     private var clientDelegate: ClientDelegate?
@@ -164,6 +167,7 @@ public class CastManager: ObservableObject {
         isConnecting = true
 
         let newClient = CastClient(device: device)
+        newClient.usesTLS = usesTLS
         let delegate = ClientDelegate(manager: self)
         self.clientDelegate = delegate
         newClient.delegate = delegate
@@ -475,9 +479,14 @@ public class CastManager: ObservableObject {
             return
         }
 
+        // A new media session — a fresh load, or the receiver replacing what
+        // it plays — makes the last reported length another media's.
+        if let previous = lastMediaStatus?.mediaSessionId, previous != 0, status.mediaSessionId != previous {
+            lastKnownDuration = nil
+        }
         lastMediaStatus = status
+        noteQueue(in: status)   // forgets the length on an item change, before telling the app
         if let duration = status.duration, duration > 0 { lastKnownDuration = duration }
-        noteQueue(in: status)
         castPosition = status.estimatedCurrentTime
         isCastPlaying = status.playerState == .playing || status.playerState == .buffering
         if playerState != status.playerState {
@@ -498,6 +507,10 @@ public class CastManager: ObservableObject {
         }
         guard let itemId = status.currentItemId, itemId != 0 else { return }
         if itemId != currentItemId {
+            // Another item: the length reported for the last one is not its.
+            // It used to stand until this one reported a length of its own,
+            // which a Nest Hub may never do while playing.
+            lastKnownDuration = nil
             currentItemId = itemId
             currentItemCustomData = knownItems[itemId] ?? [:]
             onCastItemChanged?(itemId, currentItemCustomData)

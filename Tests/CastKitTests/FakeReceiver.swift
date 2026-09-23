@@ -45,7 +45,12 @@ final class FakeReceiver: @unchecked Sendable {
   private(set) var mediaVolume: Double = 1
   /// The receiver's queue: (itemId, customData) in order, and the current one.
   private(set) var queueItems: [(id: Int, custom: [String: String])] = []
-  private(set) var queueCurrentId: Int?
+  /// The current queue item; tests move it to emulate the receiver running on.
+  var queueCurrentId: Int?
+  /// The media session and length every status reports. A Nest Hub often
+  /// leaves the length out while playing: nil emulates that.
+  var mediaSessionId = 7
+  var mediaDuration: Double? = 240.5
   private var nextItemId = 1
 
   var received: [Received] {
@@ -184,15 +189,19 @@ final class FakeReceiver: @unchecked Sendable {
     return payload
   }
 
-  func mediaStatus(state: String = "PLAYING", currentTime: Double = 1.5, idleReason: String? = nil, sessionId: Int = 7, requestId: Int? = nil, withQueue: Bool = false) -> [String: Any] {
+  /// A media status of the fake's current state: `mediaSessionId`,
+  /// `mediaDuration` (left out when nil) and `queueCurrentId`.
+  func mediaStatus(state: String = "PLAYING", currentTime: Double = 1.5, idleReason: String? = nil, sessionId: Int? = nil, requestId: Int? = nil, withQueue: Bool = false) -> [String: Any] {
+    var media: [String: Any] = ["contentId": "http://example.test/a.mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED"]
+    if let duration = mediaDuration { media["duration"] = duration }
     var entry: [String: Any] = [
-      "mediaSessionId": sessionId,
+      "mediaSessionId": sessionId ?? mediaSessionId,
       "playbackRate": 1,
       "playerState": state,
       "currentTime": currentTime,
       "supportedMediaCommands": 15,
       "volume": ["level": mediaVolume, "muted": false],
-      "media": ["contentId": "http://example.test/a.mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED", "duration": 240.5],
+      "media": media,
     ]
     if let idleReason { entry["idleReason"] = idleReason }
     if let current = queueCurrentId {
@@ -255,6 +264,12 @@ final class FakeReceiver: @unchecked Sendable {
       return [(CastNamespace.media, mediaStatus(withQueue: true))]
     case (CastNamespace.media, "QUEUE_GET_ITEM_IDS"):
       return [(CastNamespace.media, ["type": "QUEUE_ITEM_IDS", "itemIds": queueItems.map(\.id)])]
+    case (CastNamespace.media, "QUEUE_GET_ITEMS"):
+      let wanted = Set((message.json["itemIds"] as? [Int]) ?? [])
+      let items = queueItems.filter { wanted.isEmpty || wanted.contains($0.id) }.map {
+        ["itemId": $0.id, "customData": $0.custom, "media": ["contentId": "http://example.test/\($0.id).mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED"]] as [String: Any]
+      }
+      return [(CastNamespace.media, ["type": "QUEUE_ITEMS", "items": items])]
     case (CastNamespace.media, "SET_VOLUME"):
       if let level = (message.json["volume"] as? [String: Any])?["level"] as? Double { mediaVolume = level }
       return [(CastNamespace.media, mediaStatus())]
