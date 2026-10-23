@@ -137,6 +137,65 @@ final class RealReceiverTests: XCTestCase {
     client.disconnect()
   }
 
+  /// Read-only: joins the app the device is running and prints what it is
+  /// playing — title, position, state, and the queued items' titles.
+  /// `CASTKIT_MEDIA_ONLY=1 CASTKIT_REAL_DEVICE=… swift test --filter testMediaStatusOnly`
+  func testMediaStatusOnly() throws {
+    guard ProcessInfo.processInfo.environment["CASTKIT_MEDIA_ONLY"] == "1",
+          let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
+      throw XCTSkip("set CASTKIT_MEDIA_ONLY=1 and CASTKIT_REAL_DEVICE")
+    }
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    scanner.stopScanning()
+    let device = try XCTUnwrap(finder.device)
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    defer { client.disconnect() }
+    let joined = XCTestExpectation(description: "joined")
+    nonisolated(unsafe) var app: CastApp?
+    client.join { result in
+      if case .success(let a) = result { app = a }
+      joined.fulfill()
+    }
+    XCTWaiter().wait(for: [joined], timeout: 10)
+    guard let app else { print("[real] nothing to join (no media app running)"); return }
+    let got = XCTestExpectation(description: "media status")
+    nonisolated(unsafe) var status: CastMediaStatus?
+    client.requestMediaStatus(for: app) { result in
+      if case .success(let s) = result { status = s }
+      got.fulfill()
+    }
+    XCTWaiter().wait(for: [got], timeout: 10)
+    guard let status else { print("[real] \(app.displayName): no media status"); return }
+    let title = status.metadata?["title"].stringValue ?? "?"
+    print("[real] \(app.displayName) playing: \(title) @ \(Int(status.currentTime))s state \(status.playerState) item \(status.currentItemId.map(String.init) ?? "-") content \((status.contentID ?? "").split(separator: "?").first.map(String.init)?.suffix(50) ?? "")")
+    let ids = XCTestExpectation(description: "queue ids")
+    nonisolated(unsafe) var itemIds: [Int] = []
+    client.queueItemIds { result in
+      if case .success(let i) = result { itemIds = i }
+      ids.fulfill()
+    }
+    XCTWaiter().wait(for: [ids], timeout: 10)
+    guard !itemIds.isEmpty else { return }
+    let items = XCTestExpectation(description: "queue items")
+    nonisolated(unsafe) var titles: [String] = []
+    client.queueItems(itemIds: itemIds) { result in
+      if case .success(let list) = result {
+        titles = list.map { "\($0.itemId):\($0.customData.values.first ?? "?") \(($0.contentId ?? "").split(separator: "?").first.map(String.init)?.suffix(40) ?? "")" }
+      }
+      items.fulfill()
+    }
+    XCTWaiter().wait(for: [items], timeout: 10)
+    print("[real] queue: \(titles.joined(separator: " | "))")
+  }
+
   /// Queues two clips and waits for the receiver to move to the second on
   /// its own: `CASTKIT_REAL_DEVICE=… CASTKIT_REAL_CLIP=<10 s clip URL>`.
   func testQueueAdvancesOnARealReceiver() throws {
