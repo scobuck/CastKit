@@ -43,6 +43,8 @@ enum CastMessageType: String {
   // of these instead of the status it was asked for; they used to fall
   // through as "unknown type" and the caller waited for a reply that had
   // already come.
+  case editTracksInfo = "EDIT_TRACKS_INFO"
+  case setPlaybackRate = "SET_PLAYBACK_RATE"
   case queueLoad = "QUEUE_LOAD"
   case queueInsert = "QUEUE_INSERT"
   case queueUpdate = "QUEUE_UPDATE"
@@ -125,6 +127,23 @@ struct CastJSONPayloadKeys {
   static let insertBefore = "insertBefore"
   static let jump = "jump"
   static let changeType = "changeType"
+  static let subtitle = "subtitle"
+  static let seriesTitle = "seriesTitle"
+  static let season = "season"
+  static let episode = "episode"
+  static let studio = "studio"
+  static let releaseDate = "releaseDate"
+  static let originalAirdate = "originalAirdate"
+  static let albumName = "albumName"
+  static let tracks = "tracks"
+  static let trackId = "trackId"
+  static let trackContentId = "trackContentId"
+  static let trackContentType = "trackContentType"
+  static let subtype = "subtype"
+  static let language = "language"
+  static let textTrackStyle = "textTrackStyle"
+  static let hlsSegmentFormat = "hlsSegmentFormat"
+  static let hlsVideoSegmentFormat = "hlsVideoSegmentFormat"
 }
 
 struct CastConstants {

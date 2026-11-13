@@ -49,6 +49,8 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
   public let preloadedItemId: Int?
   public let items: [CastQueueItemStatus]?
   public let repeatMode: String?
+  /// The tracks on (subtitles), by id.
+  public let activeTrackIds: [Int]
   /// When this report arrived.
   public let receivedAt = Date()
 
@@ -102,6 +104,7 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
     preloadedItemId = json[CastJSONPayloadKeys.preloadedItemId].int
     items = json[CastJSONPayloadKeys.items].array.map { $0.map(CastQueueItemStatus.init) }
     repeatMode = json[CastJSONPayloadKeys.repeatMode].string
+    activeTrackIds = json[CastJSONPayloadKeys.activeTrackIds].array?.compactMap(\.int) ?? []
     volumeLevel = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.level].double
     volumeMuted = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.muted].bool
 

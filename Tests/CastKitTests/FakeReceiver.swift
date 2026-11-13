@@ -43,6 +43,8 @@ final class FakeReceiver: @unchecked Sendable {
   var speaks = true
   /// The media-level volume last set on the fake.
   private(set) var mediaVolume: Double = 1
+  private(set) var activeTrackIds: [Int] = []
+  private(set) var playbackRate: Double = 1
   /// The receiver's queue: (itemId, customData) in order, and the current one.
   private(set) var queueItems: [(id: Int, custom: [String: String])] = []
   /// The current queue item; tests move it to emulate the receiver running on.
@@ -196,7 +198,8 @@ final class FakeReceiver: @unchecked Sendable {
     if let duration = mediaDuration { media["duration"] = duration }
     var entry: [String: Any] = [
       "mediaSessionId": sessionId ?? mediaSessionId,
-      "playbackRate": 1,
+      "playbackRate": playbackRate,
+      "activeTrackIds": activeTrackIds,
       "playerState": state,
       "currentTime": currentTime,
       "supportedMediaCommands": 15,
@@ -270,6 +273,12 @@ final class FakeReceiver: @unchecked Sendable {
         ["itemId": $0.id, "customData": $0.custom, "media": ["contentId": "http://example.test/\($0.id).mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED"]] as [String: Any]
       }
       return [(CastNamespace.media, ["type": "QUEUE_ITEMS", "items": items])]
+    case (CastNamespace.media, "EDIT_TRACKS_INFO"):
+      activeTrackIds = (message.json["activeTrackIds"] as? [Int]) ?? []
+      return [(CastNamespace.media, mediaStatus())]
+    case (CastNamespace.media, "SET_PLAYBACK_RATE"):
+      playbackRate = (message.json["playbackRate"] as? Double) ?? 1
+      return [(CastNamespace.media, mediaStatus())]
     case (CastNamespace.media, "SET_VOLUME"):
       if let level = (message.json["volume"] as? [String: Any])?["level"] as? Double { mediaVolume = level }
       return [(CastNamespace.media, mediaStatus())]

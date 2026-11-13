@@ -281,6 +281,112 @@ final class RealReceiverTests: XCTestCase {
     Thread.sleep(forTimeInterval: 1)
   }
 
+  /// `CASTKIT_REAL_DEVICE="Kitchen Display" CASTKIT_REAL_VIDEO=http://<mac>:8766/master.m3u8
+  /// [CASTKIT_REAL_VTT=http://<mac>:8766/en.vtt] swift test --filter testPlaysVideoOnARealReceiver`:
+  /// an HLS video (with a subtitle track when given) loads and plays, the subtitles go off and
+  /// on, the speed changes, it seeks, then stops. The device volume is put back.
+  func testPlaysVideoOnARealReceiver() throws {
+    guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty,
+          let video = ProcessInfo.processInfo.environment["CASTKIT_REAL_VIDEO"].flatMap(URL.init(string:)) else {
+      throw XCTSkip("set CASTKIT_REAL_DEVICE and CASTKIT_REAL_VIDEO (an HLS stream)")
+    }
+    let vtt = ProcessInfo.processInfo.environment["CASTKIT_REAL_VTT"].flatMap(URL.init(string:))
+    let scanner = CastDeviceScanner()
+    let finder = Finder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    scanner.stopScanning()
+    let device = try XCTUnwrap(finder.device, "no device matching \"\(wanted)\" — seen: \(finder.seen)")
+    print("[real] using \(device.name) (\(device.modelName)) caps=\(device.capabilities.rawValue)")
+
+    let events = Events()
+    let client = CastClient(device: device)
+    client.delegate = events
+    client.connect()
+    XCTWaiter().wait(for: [events.connected], timeout: 15)
+    XCTAssertTrue(client.isConnected, "did not connect: \(events.errors)")
+    defer { client.disconnect() }
+    let statusSeen = XCTestExpectation(description: "receiver status")
+    if events.receiverStatuses.isEmpty {
+      events.onFirstReceiverStatus = { statusSeen.fulfill() }
+      XCTWaiter().wait(for: [statusSeen], timeout: 10)
+    }
+    let originalVolume = events.receiverStatuses.first.map { Float($0.volume) }
+    client.setVolume(0.1)
+    let restoreVolume = ProcessInfo.processInfo.environment["CASTKIT_RESTORE_VOLUME"].flatMap(Float.init) ?? originalVolume ?? 0.36
+    defer {
+      client.setVolume(restoreVolume)
+      print("[real] volume put back to \(restoreVolume)")
+      Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    let launched = expectation(description: "launched")
+    let appBox = ResultBox<CastApp>()
+    client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { result in
+      appBox.value = result
+      launched.fulfill()
+    }
+    wait(for: [launched], timeout: 15)
+    let app = try XCTUnwrap(appBox.value).get()
+
+    let tracks = vtt.map { [CastMediaTrack(id: 1, contentID: $0, name: "English", language: "en")] } ?? []
+    let media = CastMedia(url: video, contentType: "application/x-mpegurl",
+                          metadata: .tvShow(seriesTitle: "CastKit Test", episodeTitle: "Test Pattern", season: 1, episode: 1),
+                          duration: nil, tracks: tracks, activeTrackIds: tracks.isEmpty ? [] : [1],
+                          textTrackStyle: CastTextTrackStyle(fontScale: 1.1), hlsSegmentFormat: "aac", hlsVideoSegmentFormat: "mpeg2_ts")
+    let playing = events.expectStatus("playing") { $0.playerState == .playing }
+    let loaded = expectation(description: "loaded")
+    client.load(media: media, with: app) { result in
+      print("[real] load reply: \(result)")
+      loaded.fulfill()
+    }
+    wait(for: [loaded], timeout: 20)
+    XCTWaiter().wait(for: [playing], timeout: 60)
+    let playingStatus = try XCTUnwrap(events.statuses.last(where: { $0.playerState == .playing }),
+                                      "never reported PLAYING: \(events.statuses.map(\.description)) \(events.errors)")
+    print("[real] playing at \(playingStatus.currentTime)s of \(playingStatus.duration.map { "\($0)" } ?? "?")s, tracks on \(playingStatus.activeTrackIds)")
+    Thread.sleep(forTimeInterval: 4)
+
+    if !tracks.isEmpty {
+      for ids in [[Int](), [1]] {
+        let edited = expectation(description: "tracks \(ids)")
+        let box = ResultBox<CastMediaStatus>()
+        client.editTracks(activeTrackIds: ids) { result in
+          box.value = result
+          edited.fulfill()
+        }
+        wait(for: [edited], timeout: 10)
+        let status = try XCTUnwrap(box.value).get()
+        print("[real] tracks now \(status.activeTrackIds)")
+        XCTAssertEqual(status.activeTrackIds, ids)
+        Thread.sleep(forTimeInterval: 3)
+      }
+    }
+
+    let rated = expectation(description: "rate")
+    let rateBox = ResultBox<CastMediaStatus>()
+    client.setPlaybackRate(1.5) { result in
+      rateBox.value = result
+      rated.fulfill()
+    }
+    wait(for: [rated], timeout: 10)
+    print("[real] rate reply: \((try? rateBox.value?.get())?.playbackRate.description ?? "rejected")")
+    client.setPlaybackRate(1)
+
+    let sought = expectation(description: "seek")
+    client.seek(to: 20) { _ in sought.fulfill() }
+    wait(for: [sought], timeout: 10)
+    Thread.sleep(forTimeInterval: 3)
+    print("[real] after seek: \(events.statuses.last?.description ?? "-")")
+
+    let stopped = expectation(description: "stop")
+    client.stop { _ in stopped.fulfill() }
+    wait(for: [stopped], timeout: 10)
+    client.stopCurrentApp() // back to the device's own screen
+    Thread.sleep(forTimeInterval: 1)
+  }
+
   func testPlaysOnARealReceiver() throws {
     guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
       throw XCTSkip("set CASTKIT_REAL_DEVICE to (part of) a device name to run against real hardware")

@@ -774,6 +774,19 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     receiverControlChannel.setVolume(volume)
   }
 
+  /// Which tracks are on, and how text is drawn.
+  public func editTracks(activeTrackIds: [Int], textTrackStyle: CastTextTrackStyle? = nil, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendEditTracks(activeTrackIds: activeTrackIds, textTrackStyle: textTrackStyle, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
+  public func setPlaybackRate(_ rate: Double, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
+    withMediaSession(completion: completion) { [weak self] app, sessionId in
+      self?.mediaControlChannel.sendPlaybackRate(rate, for: app, mediaSessionId: sessionId, completion: completion)
+    }
+  }
+
   /// The media's own volume (0–1), independent of the device volume.
   public func setMediaVolume(_ level: Float, muted: Bool? = nil, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
     withMediaSession(completion: completion) { [weak self] app, sessionId in

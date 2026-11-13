@@ -88,6 +88,10 @@ public class CastManager: ObservableObject {
     /// Whether the receiver app is stopped when this app is terminated.
     /// Off, the receiver plays on through whatever it has queued.
     public var stopsReceiverOnTerminate = true
+
+    /// The receiver app launched for media: Google's Default Media Receiver unless the app
+    /// registered its own (a Styled or Custom receiver's App ID).
+    public var receiverAppId = CastAppIdentifier.defaultMediaPlayer
     /// Items the receiver reported, by id — their custom data.
     private var knownItems: [Int: [String: String]] = [:]
     /// The custom data of every queue item the receiver has reported, by id.
@@ -276,7 +280,7 @@ public class CastManager: ObservableObject {
             // Already have a running session — load new media directly
             load(currentApp)
         } else {
-            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self] result in
+            client.launch(appId: receiverAppId) { [weak self] result in
                 Task { @MainActor [weak self] in
                     guard let self, self.loadGeneration == generation else { return }
                     switch result {
@@ -310,6 +314,15 @@ public class CastManager: ObservableObject {
     /// Seek to a position on the Cast device.
     public func seekCast(to seconds: TimeInterval) {
         client?.seek(to: Float(seconds))
+    }
+
+    /// Turns tracks on (a subtitle's id) or all off (empty), with how text is drawn.
+    public func setActiveTracks(_ ids: [Int], style: CastTextTrackStyle? = nil) {
+        client?.editTracks(activeTrackIds: ids, textTrackStyle: style)
+    }
+
+    public func setPlaybackRate(_ rate: Double) {
+        client?.setPlaybackRate(rate)
     }
 
     /// Loads a queue on the receiver, launching the receiver app first when
@@ -354,7 +367,7 @@ public class CastManager: ObservableObject {
         if let currentApp {
             load(currentApp)
         } else {
-            client.launch(appId: CastAppIdentifier.defaultMediaPlayer) { [weak self] result in
+            client.launch(appId: receiverAppId) { [weak self] result in
                 Task { @MainActor [weak self] in
                     guard let self, self.loadGeneration == generation else { return }
                     switch result {

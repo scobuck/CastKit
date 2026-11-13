@@ -134,6 +134,28 @@ class MediaControlChannel: CastChannel {
     send(request, completion: completion)
   }
 
+  /// Which tracks are on (subtitles: none, or one), and how text is drawn.
+  public func sendEditTracks(activeTrackIds: [Int], textTrackStyle: CastTextTrackStyle?, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    var payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.editTracksInfo.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.activeTrackIds: activeTrackIds
+    ]
+    if let textTrackStyle { payload[CastJSONPayloadKeys.textTrackStyle] = textTrackStyle.dict }
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
+  public func sendPlaybackRate(_ rate: Double, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion? = nil) {
+    let payload: [String: Any] = [
+      CastJSONPayloadKeys.type: CastMessageType.setPlaybackRate.rawValue,
+      CastJSONPayloadKeys.mediaSessionId: mediaSessionId,
+      CastJSONPayloadKeys.playbackRate: rate
+    ]
+    let request = requestDispatcher.request(withNamespace: namespace, destinationId: app.transportId, payload: payload)
+    send(request, completion: completion)
+  }
+
   private func send(_ message: CastMessageType, for app: CastApp, mediaSessionId: Int, completion: StatusCompletion?) {
     let payload: [String: Any] = [
       CastJSONPayloadKeys.type: message.rawValue,

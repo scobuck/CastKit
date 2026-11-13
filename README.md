@@ -91,6 +91,29 @@ castManager.setCastVolume(0.5)
 castManager.disconnect()
 ```
 
+### 5. Video (1.6)
+
+```swift
+// An episode, with a WebVTT subtitle track on at load.
+let media = CastMedia(
+    url: streamURL, contentType: "application/x-mpegurl",
+    metadata: .tvShow(seriesTitle: "Neagley", episodeTitle: "Team Building Exercises", season: 1, episode: 2),
+    poster: stillURL, duration: 2820,
+    tracks: [CastMediaTrack(id: 1, contentID: vttURL, name: "English", language: "en")],
+    activeTrackIds: [1], textTrackStyle: CastTextTrackStyle(fontScale: 1.2),
+    hlsSegmentFormat: "aac", hlsVideoSegmentFormat: "mpeg2_ts", currentTime: 600)
+castManager.load(media)
+
+castManager.setActiveTracks([])      // subtitles off
+castManager.setActiveTracks([1])     // back on
+castManager.setPlaybackRate(1.5)
+castManager.receiverAppId = "ABCD1234" // your Styled or Custom receiver, before connecting
+```
+
+Metadata types: `.generic`, `.movie`, `.tvShow`, `.musicTrack` (the original `CastMedia(title:artist:…)` initializer still sends a music track).
+
+**Google's Default Media Receiver fetches media from a web origin (`https://www.gstatic.com`), so the server must send CORS headers** (`Access-Control-Allow-Origin`) on playlists, segments and subtitle files; without them it fetches the playlist and goes IDLE/ERROR (Nest Hub, 2026-11-13). Real-device check: `CASTKIT_REAL_DEVICE=<name> CASTKIT_REAL_VIDEO=<HLS URL> [CASTKIT_REAL_VTT=<WebVTT URL>] swift test --filter testPlaysVideoOnARealReceiver`.
+
 ## What's Included
 
 - **CastManager** — High-level `ObservableObject` managing the full Cast lifecycle
