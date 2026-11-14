@@ -132,13 +132,28 @@ castManager.videoInfo                                         // what it reports
 
 The receiver answers with `context.sendCustomMessage(namespace, senderId, { ...reply, requestId })`, keeping the request's `requestId`.
 
+### 7. Device authentication (1.8)
+
+Every connection proves the receiver is a genuine Google Cast device before anything is sent to it, the way Chrome and Google's Cast SDK do. Right after the TLS handshake CastKit sends Cast's device-auth challenge with a fresh 16-byte nonce. The receiver answers with its device certificate, its intermediates and a signature over the nonce and its own TLS certificate, and CastKit checks that:
+
+- the certificates chain to Google's Cast Root CA or Eureka Root CA (from Chromium's source, embedded in `CastTrustRoots`), under Chromium's rules for key sizes, algorithms, key usage and expiry;
+- the device key signed this connection's nonce and TLS certificate (RSASSA-PKCS1-v1_5 with SHA-256, or SHA-1 from older devices), so a signature can't be replayed or relayed;
+- the TLS certificate is current and runs no more than four days ahead;
+- nothing on the chain is revoked, by the device's own CRL or by Chromium's fallback CRL.
+
+A receiver that fails is sent nothing but the challenge, and the connection fails with `CastError.deviceAuthenticationFailed(reason:)` (through `onCastError` on `CastManager`, or `castClient(_:connectionTo:didFailWith:)`). It can't be switched off. If you `switch` over `CastError` exhaustively, add the new case.
+
+Where CastKit differs from Chromium: the nonce must come back unchanged (Chromium only notes a mismatch); the fallback CRL's revocations apply with no expiry date; and RSASSA-PSS-signed certificate chains, which Apple's Security framework can't verify, are refused (Cast's PKI doesn't use them).
+
+Real-device check, which sends the device nothing but the challenge: `CASTKIT_AUTH_ONLY=1 CASTKIT_REAL_DEVICE="<exact name>" swift test --filter testDeviceAuthenticationOnly`.
+
 ## What's Included
 
 - **CastManager** — High-level `ObservableObject` managing the full Cast lifecycle
 - **CastablePlayer** — Protocol to decouple your player from CastKit
 - **CastButton / CastIcon** — SwiftUI views for the standard Cast icon and device picker
 - **CastDeviceScanner** — Bonjour-based device discovery
-- **CastClient** — Low-level Google Cast V2 protocol client (TLS, protobuf, channels)
+- **CastClient** — Low-level Google Cast V2 protocol client (TLS, device authentication, protobuf, channels)
 - **Channel types** — Heartbeat, receiver control, media control, multizone, device auth/connection/discovery/setup
 
 ## Acknowledgements
