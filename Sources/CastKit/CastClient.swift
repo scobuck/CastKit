@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Security
 import SwiftProtobuf
 // SwiftyJSON is vendored in the same module
 
@@ -35,6 +36,11 @@ public enum CastError: Error, Sendable {
   case timeout
   /// The connection was closed while the request was outstanding.
   case disconnected
+  /// The receiver didn't prove it is a genuine Google Cast device. Cast
+  /// device authentication runs on every connection before anything is sent;
+  /// this receiver failed it, so nothing was sent to it and the connection
+  /// was closed. `reason` says which check failed.
+  case deviceAuthenticationFailed(reason: String)
 }
 
 extension CastError: CustomStringConvertible {
@@ -50,6 +56,7 @@ extension CastError: CustomStringConvertible {
     case .notConnected: return "not connected"
     case .timeout: return "timed out"
     case .disconnected: return "disconnected"
+    case .deviceAuthenticationFailed(let reason): return "device authentication failed: \(reason)"
     }
   }
 }
@@ -120,9 +127,24 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   public weak var delegate: CastClientDelegate?
   public private(set) var connectedApp: CastApp?
 
-  /// Receivers speak TLS with a self-signed certificate. Tests speak plain
-  /// TCP to a receiver of their own on the loopback interface.
-  public var usesTLS = true
+  /// Receivers speak TLS with a self-signed certificate and prove they are
+  /// genuine Cast devices with device authentication over it, before
+  /// anything else is sent. Tests speak plain TCP to a receiver of their own
+  /// on the loopback interface, which skips both.
+  var usesTLS = true
+  /// Checks receivers' auth replies against Google's Cast roots; tests swap in their own.
+  var deviceAuthenticator = CastDeviceAuthenticator.google
+  /// Tests: authenticate over plain TCP, with this as the receiver's TLS certificate.
+  var testPeerCertificate: Data?
+  /// Tests: the time certificates are checked at.
+  var authenticationTime: @Sendable () -> Date = { Date() }
+  /// Tests against real hardware: stop once the receiver has answered the
+  /// auth challenge, send nothing more, and report the outcome here.
+  var authenticationOnly: (@Sendable (Result<CastDeviceAuthResult, CastError>) -> Void)?
+  /// What device authentication established about this receiver; nil until it passes.
+  private(set) var deviceAuthentication: CastDeviceAuthResult?
+
+  private var requiresDeviceAuthentication: Bool { usesTLS || testPeerCertificate != nil }
   /// How long the receiver has to answer the first CONNECT before the
   /// attempt is given up. A socket that opens but never speaks — a stale
   /// address, a device on another network — used to count as connected.
@@ -172,7 +194,27 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   deinit {
-    disconnect()
+    // The socket thread holds the client for as long as its run loop runs, so
+    // there is no connection left to close here. Nothing below may reach the
+    // delegate or take a weak reference: the client is being deallocated, and
+    // a [weak self] now traps (disconnect() used to, when a late status had
+    // marked the client connected again).
+    connectWatchdog?.cancel()
+    let handlers = responseHandlers
+    responseHandlers.removeAll()
+    for (_, entry) in handlers {
+      entry.timeout.cancel()
+    }
+    if !handlers.isEmpty {
+      DispatchQueue.main.async {
+        for (_, entry) in handlers {
+          entry.handler(.failure(.disconnected))
+        }
+      }
+    }
+    for channel in channels.values {
+      channel.requestDispatcher = nil
+    }
   }
 
   // MARK: - Socket Setup
@@ -181,8 +223,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     didSet {
       if oldValue != isConnected {
         if isConnected {
-          connectWatchdog?.cancel()
-          connectWatchdog = nil
+          cancelConnectWatchdog()
           DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.castClient(self, didConnectTo: self.device)
@@ -197,48 +238,131 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
   }
 
-  private var inputStream: InputStream! {
-    didSet {
-      if let inputStream = inputStream {
-        reader = CastV2PlatformReader(stream: inputStream)
-      } else {
-        reader = nil
+  /// One socket: its streams, the frame reader, and the run loop of the
+  /// thread serving it. Each connection has its own, so one being torn down
+  /// can't close, read or write the next one's streams (disconnect() used to
+  /// close whatever streams the client held when its block ran, which after
+  /// a quick reconnect were the new connection's).
+  private final class Link: @unchecked Sendable {
+    let input: InputStream
+    let output: OutputStream
+    let reader: CastV2PlatformReader
+    let runLoop: CFRunLoop
+
+    init(input: InputStream, output: OutputStream, runLoop: CFRunLoop) {
+      self.input = input
+      self.output = output
+      self.runLoop = runLoop
+      reader = CastV2PlatformReader(stream: input)
+    }
+
+    /// Closes the streams on the link's own thread, which then ends.
+    func close() {
+      CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [self] in
+        for stream in [input, output] as [Stream] {
+          stream.delegate = nil
+          stream.close()
+          stream.remove(from: .current, forMode: .default)
+        }
+        CFRunLoopStop(CFRunLoopGetCurrent())
+      }
+      CFRunLoopWakeUp(runLoop)
+    }
+
+    /// Writes one CASTV2 frame: a 4-byte big-endian length, then the message.
+    func write(_ data: Data) throws {
+      var payloadSize = UInt32(data.count).bigEndian
+      var packet = withUnsafeBytes(of: &payloadSize) { Data($0) }
+      packet.append(data)
+
+      var totalWritten = 0
+      while totalWritten < packet.count {
+        let written = packet.withUnsafeBytes { rawBuffer in
+          let bytes = rawBuffer.bindMemory(to: UInt8.self)
+          guard let baseAddress = bytes.baseAddress else { return -1 }
+          return output.write(baseAddress + totalWritten, maxLength: packet.count - totalWritten)
+        }
+        if written < 0 {
+          throw CastError.write("Failed to write to stream")
+        }
+        if written == 0 {
+          throw CastError.write("Stream unexpectedly closed")
+        }
+        totalWritten += written
       }
     }
   }
 
-  private var outputStream: OutputStream!
-  private var streamRunLoop: CFRunLoop?
+  /// The current socket, if any.
+  private var link: Link?
+  private var currentLink: Link? { withLock { link } }
+  /// Gives up on a connection that isn't up in time. Set and cleared from
+  /// several threads, so under the lock.
   private var connectWatchdog: DispatchWorkItem?
+
+  private func cancelConnectWatchdog() {
+    let watchdog: DispatchWorkItem? = withLock {
+      defer { connectWatchdog = nil }
+      return connectWatchdog
+    }
+    watchdog?.cancel()
+  }
   private var isConnecting = false
+  /// Counts connection attempts, so a socket thread still starting when its
+  /// attempt was dropped doesn't take over a later one.
+  private var generation = 0
+  /// The channels are attached once the receiver has passed device
+  /// authentication (at once over plain TCP). Until then nothing but the auth
+  /// challenge may be sent, and the public calls answer "not connected".
   private var channelsAttached = false
+  /// A connection attempt or connection is under way and hasn't ended.
+  private var attemptActive = false
+
+  /// Where the connection is before the channels attach.
+  private enum Handshake {
+    /// Waiting for the socket (and TLS handshake) to open.
+    case waiting
+    /// The challenge is out; waiting for the receiver's reply.
+    case authenticating(nonce: Data, peerCertificate: Data)
+    /// Authenticated, or no authentication needed: the channels may attach.
+    case done
+  }
+  private var handshake = Handshake.waiting
+
+  /// Whether requests may go out: the receiver passed device authentication
+  /// (or none is needed) and the channels are attached.
+  private var isOpen: Bool { withLock { channelsAttached } }
 
   public func connect() {
-    let alreadyStarted: Bool = withLock {
-      if isConnecting || streamRunLoop != nil { return true }
+    let attempt: Int? = withLock {
+      if isConnecting || link != nil { return nil }
       isConnecting = true
-      return false
+      attemptActive = true
+      handshake = .waiting
+      deviceAuthentication = nil
+      generation += 1
+      return generation
     }
-    guard !alreadyStarted else { return }
+    guard let attempt else { return }
 
     let watchdog = DispatchWorkItem { [weak self] in
       guard let self, !self.isConnected else { return }
       self.failConnection(with: CastError.timeout)
     }
-    connectWatchdog = watchdog
+    withLock { connectWatchdog = watchdog }
     DispatchQueue.global().asyncAfter(deadline: .now() + connectTimeout, execute: watchdog)
 
     // A thread of its own, not a pooled GCD worker: the run loop below
     // blocks it for the life of the connection.
     let thread = Thread { [self] in
-      self.runSocketLoop()
+      self.runSocketLoop(attempt: attempt)
     }
     thread.name = "CastKit.socket"
     thread.qualityOfService = .userInitiated
     thread.start()
   }
 
-  private func runSocketLoop() {
+  private func runSocketLoop(attempt: Int) {
     do {
       var readStream: Unmanaged<CFReadStream>?
       var writeStream: Unmanaged<CFWriteStream>?
@@ -259,6 +383,11 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       }
 
       if usesTLS {
+        // Receivers' certificates are self-signed and name no host, so the
+        // chain isn't checked here. Device authentication checks the
+        // receiver instead, over this TLS certificate, before anything else
+        // is sent (as Chromium does: unsafely_skip_cert_verification, then
+        // the auth challenge).
         let settings: [String: Any] = [
           kCFStreamSSLValidatesCertificateChain as String: false,
           kCFStreamSSLLevel as String: kCFStreamSocketSecurityLevelNegotiatedSSL,
@@ -267,47 +396,79 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         CFWriteStreamSetProperty(writeStreamRetained, CFStreamPropertyKey(kCFStreamPropertySSLSettings), settings as CFTypeRef?)
       }
 
-      self.inputStream = readStreamRetained
-      self.outputStream = writeStreamRetained
+      let input: InputStream = readStreamRetained
+      let output: OutputStream = writeStreamRetained
+      let newLink = Link(input: input, output: output, runLoop: CFRunLoopGetCurrent())
+      let wanted: Bool = withLock {
+        guard attempt == generation, attemptActive else { return false }
+        link = newLink
+        isConnecting = false
+        return true
+      }
+      guard wanted else { return }
 
-      self.inputStream.delegate = self
+      input.delegate = self
+      // The output stream says when the socket, and the TLS handshake with
+      // it, is done: the peer's certificate is there from its first
+      // hasSpaceAvailable, not at openCompleted.
+      output.delegate = self
 
-      self.inputStream.schedule(in: .current, forMode: .default)
-      self.outputStream.schedule(in: .current, forMode: .default)
+      input.schedule(in: .current, forMode: .default)
+      output.schedule(in: .current, forMode: .default)
 
-      self.inputStream.open()
-      self.outputStream.open()
+      input.open()
+      output.open()
 
-      self.streamRunLoop = CFRunLoopGetCurrent()
-      withLock { isConnecting = false }
       // Blocks this thread to receive stream events; returns once
-      // disconnect() has removed the streams and stopped the loop.
+      // disconnect() has closed the link's streams.
       RunLoop.current.run()
     } catch {
-      withLock { isConnecting = false }
-      failConnection(with: error)
+      let current: Bool = withLock {
+        guard attempt == generation else { return false }
+        isConnecting = false
+        return true
+      }
+      if current {
+        failConnection(with: error)
+      }
     }
   }
 
-  /// The attempt is over: tell the delegate, then tear down whatever was set up.
+  /// The attempt is over: tell the delegate (once), then tear down whatever was set up.
   private func failConnection(with error: Error) {
-    connectWatchdog?.cancel()
-    connectWatchdog = nil
+    cancelConnectWatchdog()
     if isConnected {
       // Established, then broken: an ordinary disconnect.
       disconnect()
       return
     }
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
-      self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error)
+    let report: Bool = withLock {
+      defer { attemptActive = false }
+      return attemptActive
+    }
+    if report {
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delegate?.castClient(self, connectionTo: self.device, didFailWith: error)
+      }
     }
     disconnect()
   }
 
   public func disconnect() {
-    connectWatchdog?.cancel()
-    connectWatchdog = nil
+    cancelConnectWatchdog()
+
+    // Detach first, so a status already on its way in can't mark the client
+    // connected again after this, and a write queued for this socket finds
+    // it gone.
+    let closing: Link? = withLock {
+      attemptActive = false
+      handshake = .waiting
+      channelsAttached = false
+      isConnecting = false
+      defer { link = nil }
+      return link
+    }
 
     if isConnected {
       isConnected = false
@@ -332,64 +493,126 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
 
     withLock { channels }.values.forEach(remove)
-    channelsAttached = false
     connectedApp = nil
 
-    if let runLoop = streamRunLoop {
-      streamRunLoop = nil
-      CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
-        if self.inputStream != nil {
-          self.inputStream.close()
-          self.inputStream.remove(from: RunLoop.current, forMode: .default)
-          self.inputStream = nil
-        }
-
-        if self.outputStream != nil {
-          self.outputStream.close()
-          self.outputStream.remove(from: RunLoop.current, forMode: .default)
-          self.outputStream = nil
-        }
-
-        CFRunLoopStop(CFRunLoopGetCurrent())
-      }
-      CFRunLoopWakeUp(runLoop)
-    }
-    withLock { isConnecting = false }
+    closing?.close()
   }
 
   // MARK: - Socket Lifecycle
 
-  private func write(data: Data) throws {
-    guard let outputStream = outputStream else {
-      throw CastError.write("Output stream is nil")
+  /// The socket (and its TLS handshake) is open: authenticate the receiver,
+  /// or, over plain TCP, attach the channels at once. Runs on the socket thread.
+  private func socketDidOpen(_ link: Link) {
+    let proceed: Bool = withLock {
+      guard self.link === link, attemptActive, case .waiting = handshake else { return false }
+      if !requiresDeviceAuthentication { handshake = .done }
+      return true
+    }
+    guard proceed else { return }
+    guard requiresDeviceAuthentication else {
+      attachChannels()
+      return
     }
 
-    var payloadSize = UInt32(data.count).bigEndian
-    var packet = withUnsafeBytes(of: &payloadSize) { Data($0) }
-    packet.append(data)
+    guard let peerCertificate = testPeerCertificate ?? tlsPeerCertificate(of: link) else {
+      authenticationDidFinish(.failure(.noPeerCertificate))
+      return
+    }
+    do {
+      let nonce = try CastDeviceAuthenticator.makeNonce()
+      let challenge = try DeviceAuthChannel.challengeMessage(nonce: nonce)
+      let current: Bool = withLock {
+        guard self.link === link, attemptActive else { return false }
+        handshake = .authenticating(nonce: nonce, peerCertificate: peerCertificate)
+        return true
+      }
+      guard current else { return }
+      Log.auth.debug("Sending the device auth challenge to \(self.device.name, privacy: .private)")
+      try link.write(challenge)
+    } catch let failure as CastDeviceAuthFailure {
+      authenticationDidFinish(.failure(failure))
+    } catch {
+      failConnection(with: error)
+    }
+  }
 
-    var totalWritten = 0
-    while totalWritten < packet.count {
-      let written = packet.withUnsafeBytes { rawBuffer in
-        let bytes = rawBuffer.bindMemory(to: UInt8.self)
-        guard let baseAddress = bytes.baseAddress else { return -1 }
-        return outputStream.write(baseAddress + totalWritten, maxLength: packet.count - totalWritten)
+  /// The DER of the certificate the receiver presented in the TLS handshake.
+  private func tlsPeerCertificate(of link: Link) -> Data? {
+    guard let value = link.output.property(forKey: Stream.PropertyKey(kCFStreamPropertySSLPeerTrust as String)) else {
+      return nil
+    }
+    let object = value as CFTypeRef
+    guard CFGetTypeID(object) == SecTrustGetTypeID() else { return nil }
+    let trust = object as! SecTrust
+    SecTrustSetNetworkFetchAllowed(trust, false)
+    guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first else {
+      return nil
+    }
+    return SecCertificateCopyData(leaf) as Data
+  }
+
+  /// Checks the receiver's first message, which must be its auth reply.
+  /// Returns whether the connection goes on. Runs on the socket thread.
+  private func handleAuthReply(_ message: CastMessage, nonce: Data, peerCertificate: Data) -> Bool {
+    do {
+      let payload = try DeviceAuthChannel.replyPayload(message)
+      let result = try deviceAuthenticator.authenticate(reply: payload, nonce: nonce, peerCertificate: peerCertificate,
+                                                        deviceCapabilities: device.capabilities, at: authenticationTime())
+      return authenticationDidFinish(.success(result))
+    } catch let failure as CastDeviceAuthFailure {
+      return authenticationDidFinish(.failure(failure))
+    } catch {
+      return authenticationDidFinish(.failure(.malformedReply(error.localizedDescription)))
+    }
+  }
+
+  /// Opens the channels to a receiver that passed, or ends the connection to
+  /// one that didn't. Returns whether the connection goes on.
+  @discardableResult
+  private func authenticationDidFinish(_ outcome: Result<CastDeviceAuthResult, CastDeviceAuthFailure>) -> Bool {
+    switch outcome {
+    case .success(let result):
+      Log.auth.debug("""
+        \(self.device.name, privacy: .private) authenticated: chain to \(result.rootName, privacy: .public), \
+        \(result.signatureAlgorithm, privacy: .public) with \(result.hashAlgorithm, privacy: .public), \
+        revocation: \(result.revocation.rawValue, privacy: .public)\(result.isAudioOnly ? ", audio only" : "", privacy: .public)
+        """)
+      if let report = authenticationOnly {
+        report(.success(result))
+        disconnect()
+        return false
       }
-      if written < 0 {
-        throw CastError.write("Failed to write to stream")
+      let proceed: Bool = withLock {
+        guard attemptActive, case .authenticating = handshake else { return false }  // disconnected meanwhile
+        handshake = .done
+        deviceAuthentication = result
+        return true
       }
-      if written == 0 {
-        throw CastError.write("Stream unexpectedly closed")
+      guard proceed else { return false }
+      attachChannels()
+      return true
+    case .failure(let failure):
+      Log.auth.error("\(self.device.name, privacy: .private) failed device authentication: \(failure.description, privacy: .public)")
+      let error = CastError.deviceAuthenticationFailed(reason: failure.description)
+      if let report = authenticationOnly {
+        report(.failure(error))
+        disconnect()
+        return false
       }
-      totalWritten += written
+      failConnection(with: error)
+      return false
     }
   }
 
   /// Attaches the channels; each one introduces itself as it attaches
   /// (CONNECT, GET_STATUS, PING).
-  fileprivate func attachChannels() {
-    guard outputStream != nil, !channelsAttached else { return }
-    channelsAttached = true
+  private func attachChannels() {
+    let attach: Bool = withLock {
+      guard link != nil, attemptActive, case .done = handshake, !channelsAttached else { return false }
+      channelsAttached = true
+      return true
+    }
+    guard attach else { return }
 
     add(channel: connectionChannel)
     add(channel: receiverControlChannel)
@@ -401,23 +624,33 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     }
   }
 
-  private var reader: CastV2PlatformReader?
-
-  fileprivate func readStream() {
-    reader?.readStream()
+  private func readStream(_ link: Link) {
+    link.reader.readStream()
 
     var pendingResponses = [(Int, Result<JSON, CastError>)]()
 
-    while let payload = reader?.nextMessage() {
+    while let payload = link.reader.nextMessage() {
       let message: CastMessage
       do {
-        message = try CastMessage(serializedData: payload)
+        message = try CastMessage(serializedBytes: payload)
       } catch {
         // One bad frame is one bad frame; the ones behind it are fine.
         #if DEBUG
         print("[CastKit] Failed to parse message: \(error)")
         #endif
         continue
+      }
+
+      // Until the receiver has passed device authentication, its first
+      // message must be the auth reply, and nothing reaches the channels.
+      switch withLock({ handshake }) {
+      case .authenticating(let nonce, let peerCertificate):
+        guard handleAuthReply(message, nonce: nonce, peerCertificate: peerCertificate) else { return }
+        continue
+      case .waiting:
+        continue
+      case .done:
+        break
       }
 
       // Receivers also talk on namespaces this client never registers
@@ -504,6 +737,15 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   private var responseHandlers = [Int: (handler: CastResponseHandler, timeout: DispatchWorkItem)]()
 
   func send(_ request: CastRequest, response: CastResponseHandler?) {
+    // Nothing goes to a receiver that hasn't passed device authentication.
+    // (The challenge itself is written directly, not through here.)
+    guard case .done = withLock({ handshake }) else {
+      if let response {
+        DispatchQueue.main.async { response(.failure(.notConnected)) }
+      }
+      return
+    }
+
     if let response = response {
       let timeoutWork = DispatchWorkItem { [weak self] in
         guard let self = self else { return }
@@ -525,19 +767,23 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
                                                        sourceId: senderName,
                                                        destinationId: request.destinationId)
 
-      guard let runLoop = streamRunLoop else {
+      guard let link = currentLink else {
         callResponseHandler(for: requestId, with: .failure(.notConnected))
         return
       }
 
-      CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
+      CFRunLoopPerformBlock(link.runLoop, CFRunLoopMode.defaultMode.rawValue) {
+        // Written on the socket's own thread, and only to the socket it was
+        // meant for. A socket that's gone was closed by disconnect(), which
+        // tells every waiting caller "disconnected".
+        guard self.currentLink === link else { return }
         do {
-          try self.write(data: messageData)
+          try link.write(messageData)
         } catch {
           self.callResponseHandler(for: requestId, with: .failure(.request(error.localizedDescription)))
         }
       }
-      CFRunLoopWakeUp(runLoop)
+      CFRunLoopWakeUp(link.runLoop)
     } catch {
       callResponseHandler(for: requestId, with: .failure(.request(error.localizedDescription)))
     }
@@ -556,7 +802,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   // MARK: - Public messages
 
   public func getAppAvailability(apps: [CastApp], completion: @escaping @Sendable (Result<AppAvailability, CastError>) -> Void) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion(.failure(.notConnected))
       return
     }
@@ -565,7 +811,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func join(app: CastApp? = nil, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion(.failure(.notConnected))
       return
     }
@@ -619,7 +865,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   /// same `requestId`; the answer arrives as JSON text (30 s timeout).
   public func sendMessage(_ payload: [String: Any], namespace: String,
                           completion: (@Sendable (Result<String, CastError>) -> Void)? = nil) {
-    guard outputStream != nil, let app = connectedApp else {
+    guard isOpen, let app = connectedApp else {
       completion?(.failure(.notConnected))
       return
     }
@@ -631,7 +877,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func launch(appId: String, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion(.failure(.notConnected))
       return
     }
@@ -651,7 +897,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   /// Stops the receiver app this client launched or joined — not whatever
   /// app happens to be listed first, which could be another sender's.
   public func stopCurrentApp() {
-    guard outputStream != nil, let app = connectedApp else { return }
+    guard isOpen, let app = connectedApp else { return }
 
     receiverControlChannel.stop(app: app)
     connectedApp = nil
@@ -659,14 +905,14 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func leave(_ app: CastApp) {
-    guard outputStream != nil else { return }
+    guard isOpen else { return }
 
     connectionChannel.leave(app)
     connectedApp = nil
   }
 
   public func load(media: CastMedia, with app: CastApp, completion: @escaping @Sendable (Result<CastMediaStatus, CastError>) -> Void) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion(.failure(.notConnected))
       return
     }
@@ -677,7 +923,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   // MARK: Queue
 
   public func queueLoad(items: [CastQueueItem], startIndex: Int = 0, startTime: Double = 0, repeatMode: String = "REPEAT_OFF", with app: CastApp, completion: @escaping @Sendable (Result<CastMediaStatus, CastError>) -> Void) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion(.failure(.notConnected))
       return
     }
@@ -703,7 +949,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func queueItems(itemIds: [Int], completion: @escaping @Sendable (Result<[CastQueueItemStatus], CastError>) -> Void) {
-    guard outputStream != nil, let app = connectedApp else {
+    guard isOpen, let app = connectedApp else {
       completion(.failure(.notConnected))
       return
     }
@@ -722,7 +968,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func queueItemIds(completion: @escaping @Sendable (Result<[Int], CastError>) -> Void) {
-    guard outputStream != nil, let app = connectedApp else {
+    guard isOpen, let app = connectedApp else {
       completion(.failure(.notConnected))
       return
     }
@@ -741,7 +987,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func requestMediaStatus(for app: CastApp, completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)? = nil) {
-    guard outputStream != nil else {
+    guard isOpen else {
       completion?(.failure(.notConnected))
       return
     }
@@ -750,7 +996,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   private func connect(to app: CastApp) {
-    guard outputStream != nil else { return }
+    guard isOpen else { return }
 
     connectionChannel.connect(to: app)
     connectedApp = app
@@ -760,7 +1006,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   /// first if none is known yet.
   private func withMediaSession(completion: (@Sendable (Result<CastMediaStatus, CastError>) -> Void)?,
                                 _ command: @escaping @Sendable (CastApp, Int) -> Void) {
-    guard outputStream != nil, let app = connectedApp else {
+    guard isOpen, let app = connectedApp else {
       completion?(.failure(.notConnected))
       return
     }
@@ -805,7 +1051,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func setVolume(_ volume: Float) {
-    guard outputStream != nil else { return }
+    guard isOpen else { return }
 
     receiverControlChannel.setVolume(volume)
   }
@@ -831,7 +1077,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
   }
 
   public func setMuted(_ muted: Bool) {
-    guard outputStream != nil else { return }
+    guard isOpen else { return }
 
     receiverControlChannel.setMuted(muted)
   }
@@ -843,6 +1089,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       #endif
       return
     }
+    guard isOpen, multizoneControlChannel.requestDispatcher != nil else { return }
 
     multizoneControlChannel.setVolume(volume, for: device)
   }
@@ -854,6 +1101,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
       #endif
       return
     }
+    guard isOpen, multizoneControlChannel.requestDispatcher != nil else { return }
 
     multizoneControlChannel.setMuted(isMuted, for: device)
   }
@@ -861,18 +1109,32 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
 extension CastClient: StreamDelegate {
   public func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+    // The last events of a socket already torn down are not this connection's.
+    guard let link = currentLink, aStream === link.input || aStream === link.output else { return }
+    if aStream === link.output {
+      // Only its first hasSpaceAvailable matters: the socket and the TLS
+      // handshake are done. The input stream reports errors and the end.
+      if eventCode == .hasSpaceAvailable {
+        socketDidOpen(link)
+      }
+      return
+    }
     switch eventCode {
-    case Stream.Event.openCompleted:
-      // The socket is open; "connected" waits for the receiver's first
-      // word (its status, or a heartbeat).
-      attachChannels()
     case Stream.Event.errorOccurred:
       failConnection(with: aStream.streamError ?? CastError.connection("Stream error"))
     case Stream.Event.hasBytesAvailable:
-      self.readStream()
+      self.readStream(link)
     case Stream.Event.endEncountered:
-      disconnect()
+      if isConnected {
+        disconnect()
+      } else {
+        // Closed before the connection was up, by a receiver that refused the
+        // challenge, say: a failed attempt, not a quiet disconnect.
+        failConnection(with: CastError.connection("The receiver closed the connection"))
+      }
     default:
+      // openCompleted: "connected" waits for the handshake, then for the
+      // receiver's first word (its status, or a heartbeat).
       break
     }
   }
@@ -892,7 +1154,7 @@ extension CastClient: ReceiverControlChannelDelegate {
       }
     }
     currentStatus = status
-    if !isConnected {
+    if !isConnected, isOpen {
       isConnected = true
     }
   }
@@ -944,7 +1206,7 @@ extension CastClient: DeviceConnectionChannelDelegate {
 
 extension CastClient: HeartbeatChannelDelegate {
   func channelDidConnect(_ channel: HeartbeatChannel) {
-    if !isConnected {
+    if !isConnected, isOpen {
       isConnected = true
     }
   }

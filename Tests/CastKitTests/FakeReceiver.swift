@@ -16,6 +16,8 @@ final class FakeReceiver: @unchecked Sendable {
     let sourceId: String
     let destinationId: String
     let json: [String: Any]
+    /// A binary payload (the device-auth challenge).
+    var binary: Data? = nil
 
     var type: String { json["type"] as? String ?? "" }
     var requestId: Int { json["requestId"] as? Int ?? 0 }
@@ -38,9 +40,21 @@ final class FakeReceiver: @unchecked Sendable {
   /// Whether the receiver reports a running Default Media Receiver.
   var appRunning = false
   /// The default reply behaviour, which tests override per message type.
-  var overrides: [String: Script] = [:]
+  /// Locked: tests set it while the receiver's queue reads it.
+  var overrides: [String: Script] {
+    get { lock.withLock { storedOverrides } }
+    set { lock.withLock { storedOverrides = newValue } }
+  }
+  private var storedOverrides: [String: Script] = [:]
   /// When false, the receiver accepts the socket and says nothing at all.
   var speaks = true
+  /// Answers the device-auth challenge: given the DeviceAuthMessage the
+  /// client sent, the DeviceAuthMessage to send back (nil: no answer).
+  var authReply: (@Sendable (Data) -> Data?)? {
+    get { lock.withLock { storedAuthReply } }
+    set { lock.withLock { storedAuthReply = newValue } }
+  }
+  private var storedAuthReply: (@Sendable (Data) -> Data?)?
   /// The media-level volume last set on the fake.
   private(set) var mediaVolume: Double = 1
   private(set) var activeTrackIds: [Int] = []
@@ -131,6 +145,25 @@ final class FakeReceiver: @unchecked Sendable {
     connection.send(content: frame, completion: .idempotent)
   }
 
+  /// Sends a binary message (the auth reply) to the client's platform sender.
+  func sendBinary(namespace: String, payload: Data) {
+    queue.async { [self] in
+      guard let connection else { return }
+      var message = Message()
+      message.protocolVersion = .castv210
+      message.sourceID = "receiver-0"
+      message.destinationID = "sender-0"
+      message.namespace = namespace
+      message.payloadType = .binary
+      message.payloadBinary = payload
+      guard let body = try? message.serializedData() else { return }
+      var length = UInt32(body.count).bigEndian
+      var frame = Data(bytes: &length, count: 4)
+      frame.append(body)
+      connection.send(content: frame, completion: .idempotent)
+    }
+  }
+
   // MARK: - Receiving
 
   private func accept(_ connection: NWConnection) {
@@ -157,8 +190,17 @@ final class FakeReceiver: @unchecked Sendable {
       guard buffer.count >= 4 + length else { return }
       let body = buffer.subdata(in: 4..<(4 + length))
       buffer.removeSubrange(0..<(4 + length))
-      guard let message = try? Message(serializedData: body),
-            let json = try? JSONSerialization.jsonObject(with: Data(message.payloadUtf8.utf8)) as? [String: Any] else { continue }
+      guard let message = try? Message(serializedData: body) else { continue }
+      if message.payloadType == .binary {
+        let received = Received(namespace: message.namespace, sourceId: message.sourceID,
+                                destinationId: message.destinationID, json: [:], binary: message.payloadBinary)
+        lock.withLock { receivedMessages.append(received) }
+        if speaks, message.namespace == CastNamespace.auth, let reply = authReply?(message.payloadBinary) {
+          sendBinary(namespace: CastNamespace.auth, payload: reply)
+        }
+        continue
+      }
+      guard let json = try? JSONSerialization.jsonObject(with: Data(message.payloadUtf8.utf8)) as? [String: Any] else { continue }
       let received = Received(namespace: message.namespace, sourceId: message.sourceID, destinationId: message.destinationID, json: json)
       lock.withLock { receivedMessages.append(received) }
       guard speaks else { continue }

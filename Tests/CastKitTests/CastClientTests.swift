@@ -77,6 +77,11 @@ final class CastClientTests: XCTestCase {
     connect()
     XCTAssertTrue(client.isConnected)
     // The client introduced itself and asked for status, in that order.
+    // The first PING goes out right behind GET_STATUS and may still be on
+    // its way when the status reply has made the client connected.
+    let receiver = self.receiver!
+    wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in receiver.received.contains { $0.type == "PING" } },
+                                         object: nil)], timeout: 3)
     let types = receiver.received.map(\.type)
     XCTAssertEqual(types.first, "CONNECT")
     XCTAssertTrue(types.contains("GET_STATUS"))

@@ -72,6 +72,72 @@ final class RealReceiverTests: XCTestCase {
     func deviceDidGoOffline(_ device: CastDevice) {}
   }
 
+  /// Device authentication against one real receiver, and nothing else:
+  /// connects over TLS, sends the auth challenge, checks the reply against
+  /// Google's Cast roots, prints the outcome and disconnects. No CONNECT, no
+  /// status request, no heartbeat. The name must match exactly (case and all).
+  /// `CASTKIT_AUTH_ONLY=1 CASTKIT_REAL_DEVICE="Kitchen Display" swift test --filter testDeviceAuthenticationOnly`
+  func testDeviceAuthenticationOnly() throws {
+    guard ProcessInfo.processInfo.environment["CASTKIT_AUTH_ONLY"] == "1",
+          let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty else {
+      throw XCTSkip("set CASTKIT_AUTH_ONLY=1 and CASTKIT_REAL_DEVICE")
+    }
+
+    final class ExactFinder: CastDeviceScannerDelegate, @unchecked Sendable {
+      let wanted: String
+      let found = XCTestExpectation(description: "device found")
+      var matches: [CastDevice] = []
+      var seen = 0
+      init(wanted: String) { self.wanted = wanted }
+      func deviceDidComeOnline(_ device: CastDevice) {
+        seen += 1
+        guard device.name == wanted else { return }
+        if matches.isEmpty { found.fulfill() }
+        matches.append(device)
+      }
+      func deviceDidChange(_ device: CastDevice) {}
+      func deviceDidGoOffline(_ device: CastDevice) {}
+    }
+
+    let scanner = CastDeviceScanner()
+    let finder = ExactFinder(wanted: wanted)
+    scanner.delegate = finder
+    scanner.startScanning()
+    XCTWaiter().wait(for: [finder.found], timeout: 15)
+    // A moment more, to notice a second device of the same name.
+    _ = XCTWaiter().wait(for: [XCTestExpectation(description: "settle")], timeout: 2)
+    scanner.stopScanning()
+    print("[real] receivers seen: \(finder.seen); named \"\(wanted)\": \(finder.matches.count)")
+    guard finder.matches.count == 1, let device = finder.matches.first else {
+      return XCTFail("need exactly one receiver named \"\(wanted)\", found \(finder.matches.count); nothing sent")
+    }
+    print("[real] \(device.name) (\(device.modelName)) capabilities \(device.capabilities.rawValue)")
+
+    let client = CastClient(device: device)
+    let done = XCTestExpectation(description: "authentication outcome")
+    let box = ResultBox<CastDeviceAuthResult>()
+    client.authenticationOnly = { result in
+      box.value = result
+      done.fulfill()
+    }
+    client.connect()
+    XCTWaiter().wait(for: [done], timeout: 20)
+    client.disconnect()
+
+    switch box.value {
+    case .success(let result):
+      // The device certificate's own name identifies the unit; it isn't printed.
+      print("[real] PASSED: chain device → \(result.chain.dropFirst().joined(separator: " → "))")
+      print("[real] root \(result.rootName); signature \(result.signatureAlgorithm) with \(result.hashAlgorithm)"
+            + " (reply named \(result.declaredSignatureAlgorithm)); audio-only \(result.isAudioOnly);"
+            + " long-term expiry grace \(result.usedLongTermExpiryGrace); revocation: \(result.revocation.rawValue)")
+    case .failure(let error):
+      XCTFail("[real] FAILED: \(error)")
+    case nil:
+      XCTFail("[real] no outcome within 20 s")
+    }
+  }
+
   /// Sets a device's volume and leaves: `CASTKIT_REAL_DEVICE=… CASTKIT_SET_VOLUME=0.1`.
   func testSetVolumeOnly() throws {
     guard let wanted = ProcessInfo.processInfo.environment["CASTKIT_REAL_DEVICE"], !wanted.isEmpty,
