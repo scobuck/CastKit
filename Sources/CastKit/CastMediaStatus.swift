@@ -51,6 +51,8 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
   public let repeatMode: String?
   /// The tracks on (subtitles), by id.
   public let activeTrackIds: [Int]
+  /// What the receiver is showing: the picture's size and HDR type, when it says.
+  public let videoInfo: CastVideoInfo?
   /// When this report arrived.
   public let receivedAt = Date()
 
@@ -107,8 +109,25 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
     activeTrackIds = json[CastJSONPayloadKeys.activeTrackIds].array?.compactMap(\.int) ?? []
     volumeLevel = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.level].double
     volumeMuted = json[CastJSONPayloadKeys.volume][CastJSONPayloadKeys.muted].bool
+    let video = json["videoInfo"]
+    videoInfo = video.dictionary == nil ? nil
+      : CastVideoInfo(width: video["width"].int, height: video["height"].int, hdrType: video["hdrType"].string)
 
     super.init()
+  }
+}
+
+/// The picture a receiver reports it is showing (MEDIA_STATUS `videoInfo`): its size, and its
+/// HDR type ("sdr", "hdr", "dv" in Google's Web Receiver SDK).
+public struct CastVideoInfo: Sendable, Equatable {
+  public let width: Int?
+  public let height: Int?
+  public let hdrType: String?
+
+  public init(width: Int?, height: Int?, hdrType: String?) {
+    self.width = width
+    self.height = height
+    self.hdrType = hdrType
   }
 }
 

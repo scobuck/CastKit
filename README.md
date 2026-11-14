@@ -114,6 +114,24 @@ Metadata types: `.generic`, `.movie`, `.tvShow`, `.musicTrack` (the original `Ca
 
 **Google's Default Media Receiver fetches media from a web origin (`https://www.gstatic.com`), so the server must send CORS headers** (`Access-Control-Allow-Origin`) on playlists, segments and subtitle files; without them it fetches the playlist and goes IDLE/ERROR (Nest Hub, 2026-11-13). Real-device check: `CASTKIT_REAL_DEVICE=<name> CASTKIT_REAL_VIDEO=<HLS URL> [CASTKIT_REAL_VTT=<WebVTT URL>] swift test --filter testPlaysVideoOnARealReceiver`.
 
+### 6. Your own receiver (1.7)
+
+A Custom Web Receiver can tell the sender what the device and its screen can show (Google's `canDisplayType` and `getDeviceCapabilities` only run in receiver code), on your own namespace:
+
+```swift
+castManager.receiverAppId = "ABCD1234"                       // your registered receiver
+castManager.registerNamespace("urn:x-cast:com.example.app")  // before or after connecting
+castManager.launchApp { result in                             // launches (or joins) it, loads nothing
+    castManager.sendMessage(["type": "CAPABILITIES"], namespace: "urn:x-cast:com.example.app") { reply in
+        // .success(jsonText): the receiver's answer carrying the same requestId
+    }
+}
+castManager.onCustomMessage = { namespace, jsonText in }     // messages it sends unasked
+castManager.videoInfo                                         // what it reports showing: width, height, hdrType
+```
+
+The receiver answers with `context.sendCustomMessage(namespace, senderId, { ...reply, requestId })`, keeping the request's `requestId`.
+
 ## What's Included
 
 - **CastManager** — High-level `ObservableObject` managing the full Cast lifecycle

@@ -92,6 +92,13 @@ public class CastManager: ObservableObject {
     /// The receiver app launched for media: Google's Default Media Receiver unless the app
     /// registered its own (a Styled or Custom receiver's App ID).
     public var receiverAppId = CastAppIdentifier.defaultMediaPlayer
+    /// A message from the receiver app on one of `customNamespaces`, as JSON text, that
+    /// wasn't a reply to `sendMessage`.
+    public var onCustomMessage: ((_ namespace: String, _ text: String) -> Void)?
+    /// The app's own namespaces ("urn:x-cast:…"), registered on every connection.
+    public private(set) var customNamespaces: Set<String> = []
+    /// What the receiver last said it is showing (size and HDR type), when it says.
+    public var videoInfo: CastVideoInfo? { lastMediaStatus?.videoInfo }
     /// Items the receiver reported, by id — their custom data.
     private var knownItems: [Int: [String: String]] = [:]
     /// The custom data of every queue item the receiver has reported, by id.
@@ -172,6 +179,7 @@ public class CastManager: ObservableObject {
 
         let newClient = CastClient(device: device)
         newClient.usesTLS = usesTLS
+        customNamespaces.forEach(newClient.addNamespace)
         let delegate = ClientDelegate(manager: self)
         self.clientDelegate = delegate
         newClient.delegate = delegate
@@ -238,6 +246,61 @@ public class CastManager: ObservableObject {
             currentTime: startPosition
         )
         load(media)
+    }
+
+    // MARK: - The receiver app
+
+    /// Listens on an app's own namespace on this and every later connection.
+    public func registerNamespace(_ namespace: String) {
+        customNamespaces.insert(namespace)
+        client?.addNamespace(namespace)
+    }
+
+    /// Launches `receiverAppId` (or joins it when it's already running) without loading
+    /// anything, so the app can talk to it before the first LOAD (a custom receiver that
+    /// reports what the device and its screen can show). A later `load` uses this app.
+    public func launchApp(completion: @escaping @MainActor (Result<Void, CastError>) -> Void) {
+        guard let client, client.isConnected else {
+            completion(.failure(.notConnected))
+            return
+        }
+        if let currentApp, currentApp.id == receiverAppId {
+            completion(.success(()))
+            return
+        }
+        let generation = loadGeneration
+        client.launch(appId: receiverAppId) { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self, self.loadGeneration == generation else {
+                    completion(.failure(.session("The session changed")))
+                    return
+                }
+                switch result {
+                case .success(let app):
+                    self.currentApp = app
+                    completion(.success(()))
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// Sends a JSON message on a registered namespace to the receiver app; with a completion,
+    /// waits for the app's reply carrying the same `requestId` (as JSON text).
+    public func sendMessage(_ payload: [String: Any], namespace: String,
+                            completion: (@MainActor (Result<String, CastError>) -> Void)? = nil) {
+        guard let client, client.isConnected, currentApp != nil else {
+            completion?(.failure(.notConnected))
+            return
+        }
+        guard let completion else {
+            client.sendMessage(payload, namespace: namespace)
+            return
+        }
+        client.sendMessage(payload, namespace: namespace) { result in
+            Task { @MainActor in completion(result) }
+        }
     }
 
     /// Loads media on the receiver, launching the receiver app first when
@@ -712,6 +775,13 @@ public class CastManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let manager = self?.manager, manager.client === client else { return }
                 manager.fail(with: error)
+            }
+        }
+
+        func castClient(_ client: CastClient, didReceiveMessage text: String, namespace: String, from sourceId: String) {
+            Task { @MainActor [weak self] in
+                guard let manager = self?.manager, manager.client === client else { return }
+                manager.onCustomMessage?(namespace, text)
             }
         }
 

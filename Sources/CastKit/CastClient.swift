@@ -93,11 +93,15 @@ public protocol CastClientDelegate: AnyObject {
   func castClient(_ client: CastClient, mediaDidFail error: CastError)
   /// The receiver's queue changed: these are the item ids it now holds.
   func castClient(_ client: CastClient, queueChanged itemIds: [Int], changeType: String)
+  /// The receiver app sent a message of its own on a namespace the app registered
+  /// (`addNamespace`), not as a reply to a request.
+  func castClient(_ client: CastClient, didReceiveMessage text: String, namespace: String, from sourceId: String)
 
 }
 
 // Default implementations so all methods are optional
 public extension CastClientDelegate {
+  func castClient(_ client: CastClient, didReceiveMessage text: String, namespace: String, from sourceId: String) {}
   func castClient(_ client: CastClient, willConnectTo device: CastDevice) {}
   func castClient(_ client: CastClient, didConnectTo device: CastDevice) {}
   func castClient(_ client: CastClient, didDisconnectFrom device: CastDevice) {}
@@ -592,6 +596,38 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         }
       }
     }
+  }
+
+  // MARK: - Custom namespaces
+
+  /// Listens on an app's own namespace ("urn:x-cast:…"), so its receiver app's messages
+  /// come to the delegate and `sendMessage` can address it. Registering twice is harmless.
+  public func addNamespace(_ namespace: String) {
+    guard withLock({ channels[namespace] }) == nil else { return }
+    let channel = CustomChannel(namespace: namespace)
+    channel.onMessage = { [weak self] text, sourceId in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.delegate?.castClient(self, didReceiveMessage: text, namespace: namespace, from: sourceId)
+      }
+    }
+    add(channel: channel)
+  }
+
+  /// Sends a JSON message on a registered namespace to the receiver app this client
+  /// launched or joined. With a completion, the receiver is expected to answer with the
+  /// same `requestId`; the answer arrives as JSON text (30 s timeout).
+  public func sendMessage(_ payload: [String: Any], namespace: String,
+                          completion: (@Sendable (Result<String, CastError>) -> Void)? = nil) {
+    guard outputStream != nil, let app = connectedApp else {
+      completion?(.failure(.notConnected))
+      return
+    }
+    guard let channel = withLock({ channels[namespace] }) as? CustomChannel else {
+      completion?(.failure(.request("Namespace \(namespace) isn't registered")))
+      return
+    }
+    channel.send(payload, to: app, completion: completion)
   }
 
   public func launch(appId: String, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
