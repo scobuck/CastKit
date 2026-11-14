@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 
 @MainActor
@@ -213,15 +214,15 @@ public class CastManager: ObservableObject {
     /// match the player, unless `autoplay` says otherwise.
     public func castStream(autoplay: Bool? = nil) {
         guard let client = client, client.isConnected else {
-            print("[CastManager] castStream: no client or not connected")
+            Log.manager.debug("castStream: not connected")
             return
         }
         guard !streamURL.isEmpty, let url = URL(string: streamURL) else {
-            print("[CastManager] castStream: no stream to cast")
+            Log.manager.debug("castStream: no stream to cast")
             return
         }
         if let player, !player.hasMedia {
-            print("[CastManager] castStream: player has nothing loaded")
+            Log.manager.debug("castStream: the player has nothing loaded")
             return
         }
 
@@ -308,7 +309,7 @@ public class CastManager: ObservableObject {
     /// the app's own player is left alone.
     public func load(_ media: CastMedia) {
         guard let client = client, client.isConnected else {
-            print("[CastManager] load: no client or not connected")
+            Log.manager.debug("load: not connected")
             return
         }
         isCastPlaying = media.autoplay
@@ -332,7 +333,7 @@ public class CastManager: ObservableObject {
                         if status.playerState == .idle, status.idleReason == nil { return }
                         self.apply(status)
                     case .failure(let error):
-                        print("[CastManager] Load failed: \(error)")
+                        Log.manager.error("load failed: \(error.description, privacy: .public)")
                         self.fail(with: error)
                     }
                 }
@@ -351,7 +352,7 @@ public class CastManager: ObservableObject {
                         self.currentApp = app
                         load(app)
                     case .failure(let error):
-                        print("[CastManager] Launch failed: \(error)")
+                        Log.manager.error("launch failed: \(error.description, privacy: .public)")
                         self.loadInFlight = false
                         self.fail(with: error)
                     }
@@ -393,7 +394,7 @@ public class CastManager: ObservableObject {
     /// through the queue by itself.
     public func loadQueue(_ items: [CastQueueItem], startIndex: Int = 0, startTime: TimeInterval = 0) {
         guard let client = client, client.isConnected else {
-            print("[CastManager] loadQueue: no client or not connected")
+            Log.manager.debug("loadQueue: not connected")
             return
         }
         isCastPlaying = items.indices.contains(startIndex) ? items[startIndex].autoplay : true
@@ -420,7 +421,7 @@ public class CastManager: ObservableObject {
                         if status.playerState == .idle, status.idleReason == nil { return }
                         self.apply(status)
                     case .failure(let error):
-                        print("[CastManager] Queue load failed: \(error)")
+                        Log.manager.error("queue load failed: \(error.description, privacy: .public)")
                         self.fail(with: error)
                     }
                 }
@@ -438,7 +439,7 @@ public class CastManager: ObservableObject {
                         self.currentApp = app
                         load(app)
                     case .failure(let error):
-                        print("[CastManager] Launch failed: \(error)")
+                        Log.manager.error("launch failed: \(error.description, privacy: .public)")
                         self.loadInFlight = false
                         self.fail(with: error)
                     }
@@ -548,7 +549,7 @@ public class CastManager: ObservableObject {
             let wasIdle = playerState == .idle
             playerState = .idle
             if !wasIdle {
-                print("[CastManager] receiver idle: \(status.idleReasonRaw ?? "-")")
+                Log.manager.debug("receiver idle: \(status.idleReasonRaw ?? "-", privacy: .public)")
                 onCastStateChanged?(.idle)
                 onCastIdle?(status.idleReason)
             }
@@ -566,7 +567,7 @@ public class CastManager: ObservableObject {
         castPosition = status.estimatedCurrentTime
         isCastPlaying = status.playerState == .playing || status.playerState == .buffering
         if playerState != status.playerState {
-            print("[CastManager] receiver \(status.playerState.rawValue) at \(String(format: "%.1f", status.currentTime))s")
+            Log.manager.debug("receiver \(status.playerState.rawValue, privacy: .public) at \(status.currentTime, format: .fixed(precision: 1)) s")
             playerState = status.playerState
             onCastStateChanged?(status.playerState)
         }

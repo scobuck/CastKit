@@ -397,12 +397,19 @@ struct CastDeviceAuthenticator: Sendable {
     SecTrustSetVerifyDate(trust, date as CFDate)
     var error: CFError?
     guard SecTrustEvaluateWithError(trust, &error) else {
+      // Codes, not the evaluator's own text, which names the certificate
+      // (a device's common name identifies the unit).
       let code = error.map { CFErrorGetCode($0) } ?? 0
-      let text = error.map { CFErrorCopyDescription($0) as String } ?? "not trusted"
-      if code == Int(errSecCertificateExpired) || code == Int(errSecCertificateNotValidYet) {
-        throw CastDeviceAuthFailure.certificateDate(text)
+      switch OSStatus(code) {
+      case errSecCertificateExpired:
+        throw CastDeviceAuthFailure.certificateDate("expired")
+      case errSecCertificateNotValidYet:
+        throw CastDeviceAuthFailure.certificateDate("not yet valid")
+      case errSecNotTrusted, errSecCreateChainFailed:
+        throw CastDeviceAuthFailure.untrustedChain("no path to a trusted root")
+      default:
+        throw CastDeviceAuthFailure.untrustedChain("trust evaluation failed, \(code)")
       }
-      throw CastDeviceAuthFailure.untrustedChain(text)
     }
     guard let path = SecTrustCopyCertificateChain(trust) as? [SecCertificate], !path.isEmpty else {
       throw CastDeviceAuthFailure.untrustedChain("no path to an anchor")

@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Network
 
 /// Context passed through the DNS-SD resolve callback.
@@ -40,16 +41,12 @@ public final class CastDeviceScanner: @unchecked Sendable {
 
     setupAndStartBrowser()
 
-    #if DEBUG
-      NSLog("[CastKit] Started scanning for _googlecast._tcp")
-    #endif
+    Log.discovery.debug("started scanning for _googlecast._tcp")
   }
 
   /// Stops the current scan and starts a fresh one, even if already scanning.
   public func restartScanning() {
-    #if DEBUG
-      NSLog("[CastKit] Restarting scan (wasScanning: \(isScanning), devices: \(devices.count))")
-    #endif
+    Log.discovery.debug("restarting scan (was scanning: \(self.isScanning), devices: \(self.devices.count))")
 
     browser?.cancel()
     browser = nil
@@ -70,9 +67,7 @@ public final class CastDeviceScanner: @unchecked Sendable {
     isScanning = false
     cancelAllResolves()
 
-    #if DEBUG
-      NSLog("[CastKit] Stopped scanning")
-    #endif
+    Log.discovery.debug("stopped scanning")
   }
 
   public func reset() {
@@ -102,22 +97,16 @@ public final class CastDeviceScanner: @unchecked Sendable {
       switch state {
       case .ready:
         self.isScanning = true
-        #if DEBUG
-          NSLog("[CastKit] NWBrowser ready")
-        #endif
+        Log.discovery.debug("browser ready")
       case .waiting(let error):
         // Browsing can't proceed — local network access denied, or no
         // network. Left as "searching…" forever, nobody knew.
         self.isScanning = false
-        #if DEBUG
-          NSLog("[CastKit] NWBrowser waiting: \(error)")
-        #endif
+        Log.discovery.debug("browser waiting: \(String(describing: error), privacy: .public)")
         self.delegate?.scannerDidFail(Self.describe(error))
       case .failed(let error):
         self.isScanning = false
-        #if DEBUG
-          NSLog("[CastKit] NWBrowser failed: \(error)")
-        #endif
+        Log.discovery.error("browser failed: \(String(describing: error), privacy: .public)")
         self.delegate?.scannerDidFail(Self.describe(error))
       case .cancelled:
         self.isScanning = false
@@ -160,9 +149,7 @@ public final class CastDeviceScanner: @unchecked Sendable {
   private func handleServiceAdded(_ result: NWBrowser.Result) {
     guard case .service(let name, let type, let domain, _) = result.endpoint else { return }
 
-    #if DEBUG
-      NSLog("[CastKit] NWBrowser found service: \(name)")
-    #endif
+    Log.discovery.debug("found service \(name, privacy: .private)")
 
     cancelResolve(name: name)
     resolveService(name: name, type: type, domain: domain)
@@ -171,18 +158,14 @@ public final class CastDeviceScanner: @unchecked Sendable {
   private func handleServiceRemoved(_ result: NWBrowser.Result) {
     guard case .service(let name, _, _, _) = result.endpoint else { return }
 
-    #if DEBUG
-      NSLog("[CastKit] NWBrowser removed service: \(name)")
-    #endif
+    Log.discovery.debug("removed service \(name, privacy: .private)")
 
     cancelResolve(name: name)
 
     guard let deviceId = serviceDeviceMap.removeValue(forKey: name),
       let index = devices.firstIndex(where: { $0.id == deviceId }) else { return }
 
-    #if DEBUG
-      NSLog("[CastKit] Removing device: \(devices[index])")
-    #endif
+    Log.discovery.debug("removing device \(self.devices[index].name, privacy: .private)")
     let device = devices.remove(at: index)
     delegate?.deviceDidGoOffline(device)
   }
@@ -238,9 +221,7 @@ public final class CastDeviceScanner: @unchecked Sendable {
     )
 
     guard err == kDNSServiceErr_NoError, let ref else {
-      #if DEBUG
-        NSLog("[CastKit] DNSServiceResolve failed for \(name): error=\(err)")
-      #endif
+      Log.discovery.debug("resolve failed for \(name, privacy: .private): error \(err)")
       resolveContexts.removeValue(forKey: name)
       return
     }
@@ -253,9 +234,7 @@ public final class CastDeviceScanner: @unchecked Sendable {
 
   private func handleResolved(serviceName: String, hostname: String, port: Int, txtInfo: [String: String]) {
     guard let id = txtInfo["id"], !id.isEmpty else {
-      #if DEBUG
-        NSLog("[CastKit] No id in TXT for \(serviceName), skipping")
-      #endif
+      Log.discovery.debug("no id in the TXT record of \(serviceName, privacy: .private), skipped")
       return
     }
 
@@ -271,9 +250,7 @@ public final class CastDeviceScanner: @unchecked Sendable {
       iconPath: txtInfo["ic"] ?? ""
     )
 
-    #if DEBUG
-      NSLog("[CastKit] Adding device: \(device)")
-    #endif
+    Log.discovery.debug("adding device \(device.name, privacy: .private) (\(device.modelName, privacy: .public))")
 
     serviceDeviceMap[serviceName] = device.id
 

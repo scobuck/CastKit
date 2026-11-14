@@ -1,4 +1,5 @@
 import Foundation
+import os
 // SwiftyJSON is vendored in the same module
 
 class HeartbeatChannel: CastChannel {
@@ -41,9 +42,7 @@ class HeartbeatChannel: CastChannel {
     guard let rawType = json[CastJSONPayloadKeys.type].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
-      #if DEBUG
-      print("[CastKit] heartbeat: unknown message type \(rawType)")
-      #endif
+      Log.channel.debug("heartbeat: unknown message type \(rawType, privacy: .public)")
       return
     }
 

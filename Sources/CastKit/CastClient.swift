@@ -635,9 +635,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
         message = try CastMessage(serializedBytes: payload)
       } catch {
         // One bad frame is one bad frame; the ones behind it are fine.
-        #if DEBUG
-        print("[CastKit] Failed to parse message: \(error)")
-        #endif
+        Log.connection.debug("unreadable message skipped: \(error.localizedDescription, privacy: .public)")
         continue
       }
 
@@ -1084,9 +1082,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   public func setVolume(_ volume: Float, for device: CastMultizoneDevice) {
     guard device.capabilities.contains(.multizoneGroup) else {
-      #if DEBUG
-      print("Attempted to set zone volume on non-multizone device")
-      #endif
+      Log.connection.debug("zone volume asked of a device that isn't a multizone group")
       return
     }
     guard isOpen, multizoneControlChannel.requestDispatcher != nil else { return }
@@ -1096,9 +1092,7 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
 
   public func setMuted(_ isMuted: Bool, for device: CastMultizoneDevice) {
     guard device.capabilities.contains(.multizoneGroup) else {
-      #if DEBUG
-      print("Attempted to mute zone on non-multizone device")
-      #endif
+      Log.connection.debug("zone mute asked of a device that isn't a multizone group")
       return
     }
     guard isOpen, multizoneControlChannel.requestDispatcher != nil else { return }

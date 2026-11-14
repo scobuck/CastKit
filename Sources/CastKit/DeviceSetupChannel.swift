@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 class DeviceSetupChannel: CastChannel {
   init() {
@@ -29,15 +30,10 @@ class DeviceSetupChannel: CastChannel {
 
     send(request) { result in
       switch result {
-      case .success(let json):
-        #if DEBUG
-        print(json)
-        #endif
-
+      case .success:
+        Log.channel.debug("setup: reply received")
       case .failure(let error):
-        #if DEBUG
-        print(error)
-        #endif
+        Log.channel.debug("setup: \(error.description, privacy: .public)")
       }
     }
   }
@@ -54,15 +50,10 @@ class DeviceSetupChannel: CastChannel {
 
     send(request) { result in
       switch result {
-      case .success(let json):
-        #if DEBUG
-        print(json)
-        #endif
-
+      case .success:
+        Log.channel.debug("setup: reply received")
       case .failure(let error):
-        #if DEBUG
-        print(error)
-        #endif
+        Log.channel.debug("setup: \(error.description, privacy: .public)")
       }
     }
   }
@@ -79,15 +70,10 @@ class DeviceSetupChannel: CastChannel {
 
     send(request) { result in
       switch result {
-      case .success(let json):
-        #if DEBUG
-        print(json)
-        #endif
-
+      case .success:
+        Log.channel.debug("setup: reply received")
       case .failure(let error):
-        #if DEBUG
-        print(error)
-        #endif
+        Log.channel.debug("setup: \(error.description, privacy: .public)")
       }
     }
   }

@@ -1,4 +1,5 @@
 import Foundation
+import os
 // SwiftyJSON is vendored in the same module
 
 open class CastChannel: NSObject {
@@ -14,9 +15,7 @@ open class CastChannel: NSObject {
   }
 
   open func handleResponse(_ data: Data, sourceId: String) {
-    #if DEBUG
-    print("\n--Binary response--\n")
-    #endif
+    Log.channel.debug("binary message on \(self.namespace, privacy: .public) ignored")
   }
 
   /// Sends through the client this channel is attached to. A channel that

@@ -1,4 +1,5 @@
 import Foundation
+import os
 // SwiftyJSON is vendored in the same module
 
 class MultizoneControlChannel: CastChannel {
@@ -22,10 +23,7 @@ class MultizoneControlChannel: CastChannel {
     guard let rawType = json["type"].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
-      #if DEBUG
-      print("Unknown type: \(rawType)")
-      print(json)
-      #endif
+      Log.channel.debug("multizone: unknown message type \(rawType, privacy: .public)")
       return
     }
 
@@ -46,10 +44,7 @@ class MultizoneControlChannel: CastChannel {
       delegate?.channel(self, removed: deviceId)
 
     default:
-      #if DEBUG
-      print(rawType)
-      print(json)
-      #endif
+      Log.channel.debug("multizone: unhandled message type \(rawType, privacy: .public)")
     }
   }
 

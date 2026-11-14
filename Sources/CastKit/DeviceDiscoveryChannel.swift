@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 class DeviceDiscoveryChannel: CastChannel {
   init() {
@@ -12,15 +13,10 @@ class DeviceDiscoveryChannel: CastChannel {
 
     send(request) { result in
       switch result {
-      case .success(let json):
-        #if DEBUG
-        print(json)
-        #endif
-
+      case .success:
+        Log.channel.debug("device info: reply received")
       case .failure(let error):
-        #if DEBUG
-        print(error)
-        #endif
+        Log.channel.debug("device info: \(error.description, privacy: .public)")
       }
     }
   }

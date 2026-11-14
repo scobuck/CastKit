@@ -184,7 +184,7 @@ final class CastDeviceAuthTests: XCTestCase {
 
   func testUntrustedRootIsRefused() {
     assertFails(AuthFixtures.reply(nonce: nonce, chain: ["other-device", "other-ica"])) {
-      if case .untrustedChain = $0 { return true } else { return false }
+      $0 == .untrustedChain("no path to a trusted root")
     }
   }
 
@@ -203,7 +203,7 @@ final class CastDeviceAuthTests: XCTestCase {
   func testExpiredCertificateIsRefused() {
     // One year, expired five years before the test time: no grace.
     assertFails(AuthFixtures.reply(nonce: nonce, chain: ["device-expired", "ica"])) {
-      if case .certificateDate = $0 { return true } else { return false }
+      $0 == .certificateDate("expired")
     }
   }
 

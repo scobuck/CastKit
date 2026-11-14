@@ -1,4 +1,5 @@
 import Foundation
+import os
 // SwiftyJSON is vendored in the same module
 
 class ReceiverControlChannel: CastChannel {
@@ -22,9 +23,7 @@ class ReceiverControlChannel: CastChannel {
     guard let rawType = json[CastJSONPayloadKeys.type].string else { return }
 
     guard let type = CastMessageType(rawValue: rawType) else {
-      #if DEBUG
-      print("[CastKit] receiver: unknown message type \(rawType)")
-      #endif
+      Log.channel.debug("receiver: unknown message type \(rawType, privacy: .public)")
       return
     }
 
