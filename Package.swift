@@ -22,7 +22,8 @@ let package = Package(
         ),
         .testTarget(
             name: "CastKitTests",
-            dependencies: ["CastKit"]
+            dependencies: ["CastKit"],
+            resources: [.copy("Fixtures/DeviceAuth")]
         ),
     ]
 )
