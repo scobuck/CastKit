@@ -10,6 +10,10 @@ class HeartbeatChannel: CastChannel {
   /// started on the socket thread and stopped from whichever thread
   /// disconnects, which a run-loop timer does not allow.
   private let timerQueue = DispatchQueue(label: "CastKit.heartbeat")
+  /// The timers are swapped from those threads and the socket thread alike,
+  /// so they are swapped under a lock (unguarded, two threads releasing the
+  /// same watchdog crashed the process).
+  private let timerLock = NSLock()
   private var pingSource: DispatchSourceTimer?
   private var watchdog: DispatchWorkItem?
 
@@ -58,12 +62,16 @@ class HeartbeatChannel: CastChannel {
   /// never speaks — a stale address, a device on another network — is
   /// given up on rather than held "connected" for good.
   private func armWatchdog() {
-    watchdog?.cancel()
+    guard requestDispatcher != nil else { return }  // detached: nothing to watch
     let item = DispatchWorkItem { [weak self] in
       guard let self else { return }
       self.delegate?.channelDidTimeout(self)
     }
-    watchdog = item
+    let previous: DispatchWorkItem? = timerLock.withLock {
+      defer { watchdog = item }
+      return watchdog
+    }
+    previous?.cancel()
     timerQueue.asyncAfter(deadline: .now() + disconnectTimeout, execute: item)
   }
 
@@ -75,15 +83,24 @@ class HeartbeatChannel: CastChannel {
       self?.sendPing()
     }
     source.resume()
-    pingSource = source
+    let previous: DispatchSourceTimer? = timerLock.withLock {
+      defer { pingSource = source }
+      return pingSource
+    }
+    previous?.cancel()
     sendPing()
   }
 
   private func stopBeating() {
-    pingSource?.cancel()
-    pingSource = nil
-    watchdog?.cancel()
-    watchdog = nil
+    let (ping, watch) = timerLock.withLock {
+      defer {
+        pingSource = nil
+        watchdog = nil
+      }
+      return (pingSource, watchdog)
+    }
+    ping?.cancel()
+    watch?.cancel()
   }
 
   private func sendPing() {
