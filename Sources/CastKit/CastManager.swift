@@ -90,6 +90,36 @@ public class CastManager: ObservableObject {
     /// Off, the receiver plays on through whatever it has queued.
     public var stopsReceiverOnTerminate = true
 
+    // MARK: Suspending in the background
+
+    /// A session left running on the receiver while this app was away: the device, and the
+    /// receiver app's session to rejoin.
+    public struct SuspendedSession: Sendable {
+        public let device: CastDevice
+        public let appId: String
+        public let appSessionId: String
+        /// Where the receiver was, and whether it was playing, when the app left.
+        public let position: TimeInterval
+        public let wasPlaying: Bool
+    }
+
+    /// iOS and tvOS: the session is suspended when the app goes to the background and resumed
+    /// when it comes back, as Google's sender SDK does by default
+    /// (`suspendSessionsWhenBackgrounded`). iOS suspends a backgrounded app within seconds, and
+    /// its connection with it; before, that dropped connection ended the session. Suspended,
+    /// the receiver plays on untouched; resumed, the app rejoins the same receiver session and
+    /// carries on where it is, or, when it has gone, the session ends as usual.
+    public var suspendsSessionWhenBackgrounded = true
+    /// The session suspended, if one is.
+    public private(set) var suspendedSession: SuspendedSession?
+    /// The session was suspended: the receiver plays on; `isConnected` is false until resumed.
+    public var onCastSuspended: (() -> Void)?
+    /// The suspended session is back: rejoined, with the receiver's media as it is now (nil
+    /// when it has nothing loaded). `onCastConnected` isn't called for a resume.
+    public var onCastResumed: ((CastMediaStatus?) -> Void)?
+    /// A resume under way: the connection is being made again.
+    private var resuming: SuspendedSession?
+
     /// The receiver app launched for media: Google's Default Media Receiver unless the app
     /// registered its own (a Styled or Custom receiver's App ID).
     public var receiverAppId = CastAppIdentifier.defaultMediaPlayer
@@ -132,6 +162,26 @@ public class CastManager: ObservableObject {
 
         #if os(iOS) || os(tvOS)
         NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.suspendsSessionWhenBackgrounded else { return }
+                self.suspend()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.suspendsSessionWhenBackgrounded else { return }
+                self.resume()
+            }
+        }
+        NotificationCenter.default.addObserver(
             forName: UIApplication.willTerminateNotification,
             object: nil,
             queue: .main
@@ -172,6 +222,9 @@ public class CastManager: ObservableObject {
     }
 
     public func connect(to device: CastDevice) {
+        // A device picked now replaces anything left suspended.
+        suspendedSession = nil
+        resuming = nil
         if client != nil || isConnected || isConnecting {
             disconnect()
         }
@@ -527,7 +580,85 @@ public class CastManager: ObservableObject {
 
     public func disconnect() {
         endReason = nil
+        suspendedSession = nil
+        resuming = nil
         endSession(stopApp: true)
+    }
+
+    /// Leaves the receiver playing and closes the connection, remembering the session to
+    /// rejoin (`resume`). Nothing to suspend without a receiver app running.
+    public func suspend() {
+        guard let client, isConnected, let app = currentApp, !app.sessionId.isEmpty else { return }
+        suspendedSession = SuspendedSession(device: client.device, appId: app.id, appSessionId: app.sessionId,
+                                            position: estimatedPosition, wasPlaying: isCastPlaying)
+        Log.manager.info("session suspended (app in the background)")
+        client.delegate = nil
+        client.leave(app)
+        client.disconnect()
+        self.client = nil
+        clientDelegate = nil
+        currentApp = nil
+        isConnected = false
+        isConnecting = false
+        loadInFlight = false
+        loadGeneration += 1
+        onCastSuspended?()
+    }
+
+    /// Connects to the suspended session's device again and rejoins its receiver session.
+    public func resume() {
+        guard let suspended = suspendedSession, client == nil, !isConnected, !isConnecting else { return }
+        suspendedSession = nil
+        resuming = suspended
+        Log.manager.info("resuming the suspended session")
+        endReason = nil
+        isConnecting = true
+        let newClient = CastClient(device: suspended.device)
+        newClient.usesTLS = usesTLS
+        customNamespaces.forEach(newClient.addNamespace)
+        let delegate = ClientDelegate(manager: self)
+        clientDelegate = delegate
+        newClient.delegate = delegate
+        client = newClient
+        newClient.connect()
+    }
+
+    /// Connected again for a resume: the receiver app with the same session, then its media.
+    /// Gone (stopped from the TV, idled out, another sender took over), the session ends.
+    private func rejoin(_ suspended: SuspendedSession, on client: CastClient) {
+        client.requestReceiverStatus { [weak self, weak client] result in
+            Task { @MainActor [weak self] in
+                guard let self, let client, self.client === client else { return }
+                guard case .success(let status) = result,
+                      let app = status.apps.first(where: { $0.sessionId == suspended.appSessionId }) else {
+                    Log.manager.info("resume: the receiver session is over")
+                    self.resuming = nil
+                    self.fail(with: .session("The receiver stopped playing"))
+                    return
+                }
+                client.join(app: app) { [weak self, weak client] joined in
+                    Task { @MainActor [weak self] in
+                        guard let self, let client, self.client === client else { return }
+                        guard case .success(let app) = joined else {
+                            self.resuming = nil
+                            self.fail(with: .session("The receiver stopped playing"))
+                            return
+                        }
+                        self.currentApp = app
+                        client.requestMediaStatus(for: app) { [weak self] media in
+                            Task { @MainActor [weak self] in
+                                guard let self, self.client === client else { return }
+                                self.resuming = nil
+                                let status = try? media.get()
+                                if let status { self.apply(status) }
+                                Log.manager.info("session resumed")
+                                self.onCastResumed?(status)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     deinit {
@@ -619,6 +750,7 @@ public class CastManager: ObservableObject {
     private func endSession(stopApp: Bool) {
         let hadSession = client != nil || isConnected || isConnecting
         let lastPosition = estimatedPosition
+        resuming = nil
         wasPlayingAtEnd = isCastPlaying
 
         if stopApp { client?.stopCurrentApp() }
@@ -714,6 +846,11 @@ public class CastManager: ObservableObject {
                 manager.isConnected = true
                 manager.connectedDeviceName = device.name
                 manager.connectedDeviceId = device.id
+                // Back from the background: the same receiver session, not a new cast.
+                if let suspended = manager.resuming {
+                    manager.rejoin(suspended, on: client)
+                    return
+                }
                 manager.onCastConnected?()
                 // Cast what is playing, from where it is. With nothing
                 // loaded, the connection just waits for the next track.

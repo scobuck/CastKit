@@ -808,6 +808,15 @@ public final class CastClient: NSObject, RequestDispatchable, Channelable, @unch
     receiverControlChannel.getAppAvailability(apps: apps, completion: completion)
   }
 
+  /// The receiver's status now: the apps it runs (with their session ids) and its volume.
+  public func requestReceiverStatus(completion: @escaping @Sendable (Result<CastStatus, CastError>) -> Void) {
+    guard isOpen else {
+      completion(.failure(.notConnected))
+      return
+    }
+    receiverControlChannel.requestStatus(completion: completion)
+  }
+
   public func join(app: CastApp? = nil, completion: @escaping @Sendable (Result<CastApp, CastError>) -> Void) {
     guard isOpen else {
       completion(.failure(.notConnected))

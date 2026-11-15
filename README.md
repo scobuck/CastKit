@@ -147,6 +147,16 @@ Where CastKit differs from Chromium: the nonce must come back unchanged (Chromiu
 
 Real-device check, which sends the device nothing but the challenge: `CASTKIT_AUTH_ONLY=1 CASTKIT_REAL_DEVICE="<exact name>" swift test --filter testDeviceAuthenticationOnly`.
 
+### 8. In the background (1.9)
+
+On iPhone, iPad and Apple TV the session is suspended when the app goes to the background and resumed when it comes back, as Google's sender SDK does by default. iOS suspends a backgrounded app within seconds, and its connection with it; a dropped connection used to end the session.
+
+- Suspended (`UIApplication.didEnterBackgroundNotification`, or `suspend()`), CastKit leaves the receiver app and closes the connection without stopping anything: the receiver plays on. `isConnected` is false, `suspendedSession` says what to rejoin, and `onCastSuspended` is called. `onCastEnded` is not.
+- Resumed (`willEnterForegroundNotification`, or `resume()`), it connects to the same device again (device authentication included), finds the receiver app with the same session id and rejoins it, takes in its media status and calls `onCastResumed` with it. `onCastConnected` isn't called, as nothing new is cast.
+- If that session has gone (stopped from the TV, idled out, another sender took over), the session ends as usual: `onCastError`, then `onCastEnded`.
+
+`suspendsSessionWhenBackgrounded = false` turns it off, for an app that keeps its connection alive in the background. Lock Screen and notification controls aren't part of it: Google's sender checklist marks them Android-only.
+
 ## What's Included
 
 - **CastManager** — High-level `ObservableObject` managing the full Cast lifecycle

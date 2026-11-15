@@ -92,4 +92,52 @@ final class CastManagerTests: XCTestCase {
     pushStatus("PLAYING", currentTime: 44)
     XCTAssertNil(manager.mediaDuration)
   }
+
+  // MARK: Suspended in the background
+
+  /// Leaving the app leaves the receiver playing: the session is suspended, not ended, and
+  /// coming back rejoins the same receiver session where it is (iOS suspends a backgrounded
+  /// app, and its connection with it; that used to end the cast).
+  func testASuspendedSessionLeavesTheReceiverPlayingAndResumes() throws {
+    loadQueue(["a"])
+    var ended = false
+    manager.onCastEnded = { _ in ended = true }
+    let suspended = expectation(description: "suspended")
+    manager.onCastSuspended = { suspended.fulfill() }
+    manager.suspend()
+    wait(for: [suspended], timeout: 5)
+    XCTAssertFalse(manager.isConnected)
+    XCTAssertNotNil(manager.suspendedSession)
+    XCTAssertTrue(receiver.appRunning, "the receiver plays on")
+    XCTAssertFalse(ended)
+
+    let resumed = expectation(description: "resumed")
+    var resumedStatus: CastMediaStatus?
+    manager.onCastConnected = { XCTFail("a resume isn't a new connection") }
+    manager.onCastResumed = { status in resumedStatus = status; resumed.fulfill() }
+    manager.resume()
+    wait(for: [resumed], timeout: 5)
+    XCTAssertTrue(manager.isConnected)
+    XCTAssertNil(manager.suspendedSession)
+    XCTAssertNotNil(resumedStatus, "the receiver's media as it is now")
+    XCTAssertFalse(ended)
+  }
+
+  /// Back after the receiver was stopped (from the TV, idled out): the session ends.
+  func testResumingAfterTheReceiverStoppedEndsTheSession() throws {
+    loadQueue(["a"])
+    let suspended = expectation(description: "suspended")
+    manager.onCastSuspended = { suspended.fulfill() }
+    manager.suspend()
+    wait(for: [suspended], timeout: 5)
+    receiver.appRunning = false
+
+    let ended = expectation(description: "ended")
+    manager.onCastResumed = { _ in XCTFail("nothing to rejoin") }
+    manager.onCastEnded = { _ in ended.fulfill() }
+    manager.resume()
+    wait(for: [ended], timeout: 5)
+    XCTAssertFalse(manager.isConnected)
+    XCTAssertNotNil(manager.endReason)
+  }
 }
