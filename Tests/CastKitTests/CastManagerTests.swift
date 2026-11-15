@@ -140,4 +140,96 @@ final class CastManagerTests: XCTestCase {
     XCTAssertFalse(manager.isConnected)
     XCTAssertNotNil(manager.endReason)
   }
+
+  // MARK: Joining another sender's session
+
+  /// Another sender's session: the receiver app running with media it loaded.
+  private func anotherSenderIsPlaying() {
+    receiver.appRunning = true
+    receiver.mediaContentId = "http://example.test/film.m3u8"
+    receiver.mediaCustomData = ["highframeItem": "42", "highframeLoad": "L1"]
+  }
+
+  /// A second device joins what the first is playing: nothing launched or loaded, the media
+  /// and its custom data as the receiver has them.
+  func testJoiningAnotherSendersSessionLoadsNothing() throws {
+    anotherSenderIsPlaying()
+    let other = CastManager()
+    other.usesTLS = false
+    defer { other.disconnect() }
+    let joined = expectation(description: "joined")
+    var joinedStatus: CastMediaStatus?
+    other.onCastConnected = { XCTFail("a join isn't a new connection") }
+    other.onCastJoined = { status in joinedStatus = status; joined.fulfill() }
+    let before = receiver.received.count
+    other.join(receiver.device)
+    wait(for: [joined], timeout: 5)
+    XCTAssertTrue(other.isConnected)
+    XCTAssertEqual(joinedStatus?.mediaCustomData?["highframeItem"], "42")
+    XCTAssertEqual(other.mediaContentID, "http://example.test/film.m3u8")
+    XCTAssertEqual(other.mediaCustomData?["highframeLoad"], "L1")
+    let sent = receiver.received.dropFirst(before).map(\.type)
+    XCTAssertFalse(sent.contains("LAUNCH"), "nothing launched: \(sent)")
+    XCTAssertFalse(sent.contains("LOAD"), "nothing loaded: \(sent)")
+  }
+
+  /// Nothing of this app running there: the join ends the session.
+  func testJoiningWithNothingRunningEndsTheSession() throws {
+    receiver.appRunning = false
+    let other = CastManager()
+    other.usesTLS = false
+    defer { other.disconnect() }
+    let ended = expectation(description: "ended")
+    var reason: CastError?
+    other.onCastJoined = { _ in XCTFail("nothing to join") }
+    other.onCastError = { reason = $0; ended.fulfill() }
+    other.join(receiver.device)
+    wait(for: [ended], timeout: 5)
+    XCTAssertFalse(other.isConnected)
+    if case .session? = reason {} else { XCTFail("ended with \(String(describing: reason))") }
+  }
+
+  /// Another sender loading something else shows as a new media session with its content and
+  /// custom data, the last one's forgotten.
+  func testAnotherSendersLoadShowsAsNewMedia() throws {
+    manager.load(CastMedia(url: URL(string: "http://example.test/mine.m3u8")!, contentType: "application/x-mpegurl",
+                           metadata: .generic(title: "Mine"), customData: ["highframeLoad": "mine"]))
+    let mine = expectation(description: "mine reported")
+    mine.assertForOverFulfill = false
+    manager.onCastPositionUpdated = { [manager] _ in if manager?.mediaCustomData?["highframeLoad"] == "mine" { mine.fulfill() } }
+    receiver.push(namespace: CastNamespace.media, payload: receiver.mediaStatus(state: "PLAYING", currentTime: 3))
+    wait(for: [mine], timeout: 5)
+    let firstSession = manager.mediaSessionId
+    XCTAssertEqual(manager.mediaContentID, "http://example.test/mine.m3u8")
+
+    receiver.mediaSessionId = 8
+    receiver.mediaContentId = "http://example.test/theirs.m3u8"
+    receiver.mediaCustomData = ["highframeLoad": "theirs"]
+    let theirs = expectation(description: "theirs reported")
+    theirs.assertForOverFulfill = false
+    manager.onCastPositionUpdated = { [manager] _ in if manager?.mediaCustomData?["highframeLoad"] == "theirs" { theirs.fulfill() } }
+    receiver.push(namespace: CastNamespace.media, payload: receiver.mediaStatus(state: "PLAYING", currentTime: 1))
+    wait(for: [theirs], timeout: 5)
+    XCTAssertNotEqual(manager.mediaSessionId, firstSession)
+    XCTAssertEqual(manager.mediaContentID, "http://example.test/theirs.m3u8")
+  }
+
+  /// Leaving a joined session closes the connection and leaves the receiver playing.
+  func testLeavingAJoinedSessionLeavesTheReceiverPlaying() throws {
+    anotherSenderIsPlaying()
+    let other = CastManager()
+    other.usesTLS = false
+    let joined = expectation(description: "joined")
+    other.onCastJoined = { _ in joined.fulfill() }
+    other.join(receiver.device)
+    wait(for: [joined], timeout: 5)
+    let ended = expectation(description: "ended")
+    other.onCastEnded = { _ in ended.fulfill() }
+    other.leave()
+    wait(for: [ended], timeout: 5)
+    XCTAssertFalse(other.isConnected)
+    XCTAssertTrue(receiver.appRunning, "the receiver plays on")
+    XCTAssertFalse(receiver.received.contains { $0.namespace == CastNamespace.receiver && $0.type == "STOP" })
+  }
 }
+

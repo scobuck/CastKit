@@ -257,7 +257,8 @@ public final class CastDeviceScanner: @unchecked Sendable {
     if let index = devices.firstIndex(where: { $0.id == device.id }) {
       let existing = devices[index]
 
-      guard existing.name != device.name || existing.hostName != device.hostName else { return }
+      // Its receiver status ("rs": the app running, if any) changes as it's used.
+      guard existing.name != device.name || existing.hostName != device.hostName || existing.status != device.status else { return }
 
       devices.remove(at: index)
       devices.insert(device, at: index)

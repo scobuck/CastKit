@@ -33,6 +33,10 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
   public let contentType: String?
   public let metadata: JSON?
   public let contentID: String?
+  /// The custom data the sender put on the media it loaded (LOAD `media.customData`), string
+  /// values only; nil when the status carries no media object (a receiver leaves it out of
+  /// reports where it hasn't changed).
+  public let mediaCustomData: [String: String]?
   public let idleReason: CastIdleReason?
   /// The receiver's own idle reason string, for reasons this library doesn't name.
   public let idleReasonRaw: String?
@@ -91,6 +95,16 @@ public final class CastMediaStatus: NSObject, @unchecked Sendable {
     duration = media[CastJSONPayloadKeys.duration].double
     contentType = media[CastJSONPayloadKeys.contentType].string
     metadata = media[CastJSONPayloadKeys.metadata]
+
+    if media.dictionary != nil {
+      var custom: [String: String] = [:]
+      for (key, value) in media[CastJSONPayloadKeys.customData].dictionaryValue {
+        if let string = value.string { custom[key] = string }
+      }
+      mediaCustomData = custom
+    } else {
+      mediaCustomData = nil
+    }
 
     if let contentID = media[CastJSONPayloadKeys.contentId].string, let data = contentID.data(using: .utf8) {
       self.contentID = (try? JSON(data: data))?[CastJSONPayloadKeys.contentId].string ?? contentID

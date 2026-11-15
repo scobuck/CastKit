@@ -66,6 +66,9 @@ final class FakeReceiver: @unchecked Sendable {
   /// The media session and length every status reports. A Nest Hub often
   /// leaves the length out while playing: nil emulates that.
   var mediaSessionId = 7
+  /// The media loaded: its content and the custom data its sender put on it (from LOAD).
+  var mediaContentId = "http://example.test/a.mp3"
+  var mediaCustomData: [String: String]?
   var mediaDuration: Double? = 240.5
   private var nextItemId = 1
 
@@ -236,8 +239,9 @@ final class FakeReceiver: @unchecked Sendable {
   /// A media status of the fake's current state: `mediaSessionId`,
   /// `mediaDuration` (left out when nil) and `queueCurrentId`.
   func mediaStatus(state: String = "PLAYING", currentTime: Double = 1.5, idleReason: String? = nil, sessionId: Int? = nil, requestId: Int? = nil, withQueue: Bool = false) -> [String: Any] {
-    var media: [String: Any] = ["contentId": "http://example.test/a.mp3", "contentType": "audio/mpeg", "streamType": "BUFFERED"]
+    var media: [String: Any] = ["contentId": mediaContentId, "contentType": "audio/mpeg", "streamType": "BUFFERED"]
     if let duration = mediaDuration { media["duration"] = duration }
+    if let mediaCustomData { media["customData"] = mediaCustomData }
     var entry: [String: Any] = [
       "mediaSessionId": sessionId ?? mediaSessionId,
       "playbackRate": playbackRate,
@@ -274,6 +278,10 @@ final class FakeReceiver: @unchecked Sendable {
       return [(CastNamespace.receiver, receiverStatus())]
     case (CastNamespace.media, "LOAD"):
       queueItems = []; queueCurrentId = nil
+      if let media = message.json["media"] as? [String: Any] {
+        if let content = media["contentId"] as? String { mediaContentId = content }
+        mediaCustomData = media["customData"] as? [String: String]
+      }
       return [(CastNamespace.media, mediaStatus(state: "BUFFERING", currentTime: 0))]
     case (CastNamespace.media, "QUEUE_LOAD"):
       let items = (message.json["items"] as? [[String: Any]]) ?? []

@@ -157,6 +157,15 @@ On iPhone, iPad and Apple TV the session is suspended when the app goes to the b
 
 `suspendsSessionWhenBackgrounded = false` turns it off, for an app that keeps its connection alive in the background. Lock Screen and notification controls aren't part of it: Google's sender checklist marks them Android-only.
 
+### 9. Joining another sender's session (1.10)
+
+A second device can control what the first one cast, as Google's sender apps do across a household:
+
+- `join(device)` connects to the device and joins the session of `receiverAppId` running there, launching and loading nothing. `onCastJoined` is called with the receiver's media status (nil when nothing is loaded); from then on its reports come in as usual and the controls (`pauseCast`, `seekCast`, `stopMedia`…) steer it. `onCastConnected` isn't called. With nothing of `receiverAppId` running, the session ends (`onCastError` with `.session`, then `onCastEnded`).
+- `leave()` closes the connection and leaves the receiver app playing, for other senders. Unlike `disconnect()`, nothing is stopped there.
+- What the receiver plays, kept across reports that leave the media out: `mediaSessionId`, `mediaContentID`, `mediaCustomData` (the `customData` its sender put on the `CastMedia` it loaded), and the last `mediaStatus`. `CastMediaStatus.mediaCustomData` carries it per report. Another sender's load shows up as a new session with its own content, which is how an app tells that something else has replaced its media.
+- A device's receiver status (`CastDevice.status`, the record's `rs`: "Casting: <title>" while something plays) now updates as it changes during discovery.
+
 ## What's Included
 
 - **CastManager** — High-level `ObservableObject` managing the full Cast lifecycle

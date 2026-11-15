@@ -120,6 +120,26 @@ public class CastManager: ObservableObject {
     /// A resume under way: the connection is being made again.
     private var resuming: SuspendedSession?
 
+    // MARK: Joining a session another sender started
+
+    /// The receiver's media was joined (`join(_:)`): connected to the running receiver app
+    /// (`receiverAppId`) without launching or loading anything, with its media as it is now
+    /// (nil when it has nothing loaded). `onCastConnected` isn't called for a join.
+    public var onCastJoined: ((CastMediaStatus?) -> Void)?
+    /// A join under way.
+    private var joining = false
+
+    // MARK: What the receiver plays
+
+    /// The receiver's media session, its content and the custom data its sender put on it, as
+    /// last reported: kept across reports that leave the media out, cleared with the session.
+    /// Another sender's load shows here as a new session with its own content.
+    public private(set) var mediaSessionId: Int?
+    public private(set) var mediaContentID: String?
+    public private(set) var mediaCustomData: [String: String]?
+    /// The receiver's last media report.
+    public var mediaStatus: CastMediaStatus? { lastMediaStatus }
+
     /// The receiver app launched for media: Google's Default Media Receiver unless the app
     /// registered its own (a Styled or Custom receiver's App ID).
     public var receiverAppId = CastAppIdentifier.defaultMediaPlayer
@@ -225,6 +245,7 @@ public class CastManager: ObservableObject {
         // A device picked now replaces anything left suspended.
         suspendedSession = nil
         resuming = nil
+        joining = false
         if client != nil || isConnected || isConnecting {
             disconnect()
         }
@@ -585,6 +606,17 @@ public class CastManager: ObservableObject {
         endSession(stopApp: true)
     }
 
+    /// Closes the connection and leaves the receiver app running with whatever it plays, for
+    /// other senders (a joined session this app doesn't want, or is done controlling).
+    /// `onCastEnded` is called as for any end; nothing is remembered to resume.
+    public func leave() {
+        endReason = nil
+        suspendedSession = nil
+        resuming = nil
+        if let client, let app = currentApp { client.leave(app) }
+        endSession(stopApp: false)
+    }
+
     /// Leaves the receiver playing and closes the connection, remembering the session to
     /// rejoin (`resume`). Nothing to suspend without a receiver app running.
     public func suspend() {
@@ -621,6 +653,52 @@ public class CastManager: ObservableObject {
         newClient.delegate = delegate
         client = newClient
         newClient.connect()
+    }
+
+    /// Connects to a device and joins the session of `receiverAppId` running there, as another
+    /// sender started it: nothing is launched or loaded, and the media's reports come here
+    /// from then on (`onCastJoined`, then the usual callbacks). Nothing of this app running
+    /// there, the session ends (`onCastError` with `.session`).
+    public func join(_ device: CastDevice) {
+        connect(to: device)
+        joining = true
+    }
+
+    /// Connected for a join: the running receiver app, then its media.
+    private func joinRunningApp(on client: CastClient) {
+        let appId = receiverAppId
+        client.requestReceiverStatus { [weak self, weak client] result in
+            Task { @MainActor [weak self] in
+                guard let self, let client, self.client === client else { return }
+                guard case .success(let status) = result, let app = status.apps.first(where: { $0.id == appId }) else {
+                    Log.manager.info("join: \(appId, privacy: .public) isn't running there")
+                    self.joining = false
+                    self.fail(with: .session("Nothing to join"))
+                    return
+                }
+                client.join(app: app) { [weak self, weak client] joined in
+                    Task { @MainActor [weak self] in
+                        guard let self, let client, self.client === client else { return }
+                        guard case .success(let app) = joined else {
+                            self.joining = false
+                            self.fail(with: .session("Nothing to join"))
+                            return
+                        }
+                        self.currentApp = app
+                        client.requestMediaStatus(for: app) { [weak self] media in
+                            Task { @MainActor [weak self] in
+                                guard let self, self.client === client else { return }
+                                self.joining = false
+                                let status = try? media.get()
+                                if let status { self.apply(status) }
+                                Log.manager.info("joined the receiver's session")
+                                self.onCastJoined?(status)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Connected again for a resume: the receiver app with the same session, then its media.
@@ -671,6 +749,7 @@ public class CastManager: ObservableObject {
 
     /// Takes in a report from the receiver.
     private func apply(_ status: CastMediaStatus) {
+        noteMedia(in: status)
         if status.playerState == .idle {
             // Idle reports that arrive while a new load is outstanding
             // belong to the media being replaced.
@@ -703,6 +782,19 @@ public class CastManager: ObservableObject {
             onCastStateChanged?(status.playerState)
         }
         onCastPositionUpdated?(castPosition)
+    }
+
+    /// Keeps what the receiver plays: a new media session forgets the last one's content until
+    /// a report names it.
+    private func noteMedia(in status: CastMediaStatus) {
+        guard status.hasMediaSession else { return }
+        if status.mediaSessionId != mediaSessionId {
+            mediaSessionId = status.mediaSessionId
+            mediaContentID = nil
+            mediaCustomData = nil
+        }
+        if let content = status.contentID { mediaContentID = content }
+        if let custom = status.mediaCustomData { mediaCustomData = custom }
     }
 
     /// Remembers the items a status carries and notices the receiver moving
@@ -766,6 +858,10 @@ public class CastManager: ObservableObject {
         isCastPlaying = false
         playerState = .idle
         lastMediaStatus = nil
+        mediaSessionId = nil
+        mediaContentID = nil
+        mediaCustomData = nil
+        joining = false
         castPosition = 0
         loadInFlight = false
         loadGeneration += 1
@@ -849,6 +945,11 @@ public class CastManager: ObservableObject {
                 // Back from the background: the same receiver session, not a new cast.
                 if let suspended = manager.resuming {
                     manager.rejoin(suspended, on: client)
+                    return
+                }
+                // Joining another sender's session: nothing launched or loaded.
+                if manager.joining {
+                    manager.joinRunningApp(on: client)
                     return
                 }
                 manager.onCastConnected?()
